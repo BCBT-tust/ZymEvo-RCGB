@@ -1,10 +1,10 @@
-# ZymEvoDock: An end-to-end molecular docking platform
+# ZymEvo: An end-to-end machine learning framework for the evolution of automated enzyme molecules
 
 [![Platform](https://img.shields.io/badge/Platform-Google_Colab-yellow)](https://colab.research.google.com/drive/1yr9DkpHFfzAHju6eyEMkuKQHHxfmNqYr?usp=sharing)
 [![License](https://img.shields.io/badge/License-Research_Free-orange)](LICENSE)
 [![Version](https://img.shields.io/badge/Version-1.0-blue)](https://github.com/your-repo/ezdock)
 
-**ZymEvoDock** is a comprehensive, automated molecular docking platform designed for enzyme engineering research. It transforms complex multi-software workflows into simple, automated processes that run entirely in Google Colab.
+**ZymEvo** is a comprehensive, automated molecular docking platform designed for enzyme engineering research. It transforms complex multi-software workflows into simple, automated processes that run entirely in Google Colab.
 
 ## 🚀 Quick Start
 
