@@ -1,8 +1,8 @@
 # =============================================================================
-# ZymEvo Batch Preprocessing ———— AutoPre—Dock
+# ZymEvo Batch Preprocessing ———— AutoPre_Dock
 # =============================================================================
 
-# @title 🧪 ZymEvo Batch Preprocessing ———— AutoPre—Dock { display-mode: "form" }
+# @title 🧪 ZymEvo Batch Preprocessing ———— AutoPre-Dock { display-mode: "form" }
 # @markdown ### Batch Processing Options
 # @markdown Configure your preprocessing parameters below
 
@@ -18,15 +18,15 @@ import sys
 print("📥 Downloading ZymEvo preprocessing script...")
 result = subprocess.run([
     "wget", "-q",
-    "https://raw.githubusercontent.com/BCBT-tust/ZymEvo-RCGB/main/autopre-dock.py",
-    "-O", "/tmp/autopre-dock.py""
+    "https://raw.githubusercontent.com/BCBT-tust/ZymEvo-RCGB/main/autopre_dock.py",
+    "-O", "/tmp/autopre_dock.py""
 ], capture_output=True)
 
 if result.returncode == 0:
     print("✓ Download complete\n")
     
     sys.path.insert(0, '/tmp')
-    from autopre-dock import MolecularPreprocessor, print_status
+    from autopre_dock import MolecularPreprocessor, print_status
     
     preprocessor = MolecularPreprocessor()
     
