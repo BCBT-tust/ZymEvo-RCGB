@@ -18,15 +18,15 @@ import sys
 print("📥 Downloading ZymEvo preprocessing script...")
 result = subprocess.run([
     "wget", "-q",
-    "https://raw.githubusercontent.com/BCBT-tust/ZymEvo-RCGB/main/AutoPre-Dock.py",
-    "-O", "/tmp/AutoPre-Dock.py"
+    "https://raw.githubusercontent.com/BCBT-tust/ZymEvo-RCGB/main/autopre-dock.py",
+    "-O", "/tmp/autopre-dock.py""
 ], capture_output=True)
 
 if result.returncode == 0:
     print("✓ Download complete\n")
     
     sys.path.insert(0, '/tmp')
-    from AutoPre-Dock import MolecularPreprocessor, print_status
+    from autopre-dock import MolecularPreprocessor, print_status
     
     preprocessor = MolecularPreprocessor()
     
@@ -72,4 +72,4 @@ if result.returncode == 0:
         
 else:
     print("❌ Failed to download preprocessing script")
-    print("Manual download: https://github.com/BCBT-tust/ZymEvo-RCGB/blob/main/AutoPre-Dock.py")
+    print("Manual download: https://github.com/BCBT-tust/ZymEvo-RCGB/blob/main/autopre-dock.py"")
