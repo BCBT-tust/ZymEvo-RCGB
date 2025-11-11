@@ -1,75 +1,470 @@
-# =============================================================================
-# ZymEvo Batch Preprocessing ———— AutoPre_Dock
-# =============================================================================
+#!/usr/bin/env python3
+"""
+ZymEvo Unified Preprocessing Script
+GitHub: https://github.com/BCBT-tust/ZymEvo-RCGB
+Batch processing for receptors and ligands with OpenBabel format conversion
+"""
 
-# @title 🧪 ZymEvo Batch Preprocessing ———— AutoPre-Dock { display-mode: "form" }
-# @markdown ### Batch Processing Options
-# @markdown Configure your preprocessing parameters below
-
-processing_mode = "Prepare Receptors (PDB → PDBQT)"  # @param ["Prepare Receptors (PDB → PDBQT)", "Prepare Ligands (→ PDBQT)", "Convert Format Only", "Interactive Mode"]
-remove_water = True  # @param {type:"boolean"}
-remove_nonstd = False  # @param {type:"boolean"}
-auto_convert = True  # @param {type:"boolean"}
-output_format = "pdb"  # @param ["pdb", "mol2", "sdf", "pdbqt"]
-
-import subprocess
+import os
 import sys
+import subprocess
+import shutil
+import threading
+import concurrent.futures
+import time
+from pathlib import Path
+from IPython.display import HTML, display
+from google.colab import files
 
-print("📥 Downloading ZymEvo preprocessing script...")
-result = subprocess.run([
-    "wget", "-q",
-    "https://raw.githubusercontent.com/BCBT-tust/ZymEvo-RCGB/main/autopre_dock.py",
-    "-O", "/tmp/autopre_dock.py""
-], capture_output=True)
+PYTHONPATH = "/usr/local/autodocktools/MGLToolsPckgs"
+MGLTOOLS_PATH = "/usr/local/autodocktools/bin/pythonsh"
+PREPARE_RECEPTOR = "/usr/local/autodocktools/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_receptor4.py"
+PREPARE_LIGAND = "/usr/local/autodocktools/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_ligand4.py"
 
-if result.returncode == 0:
-    print("✓ Download complete\n")
+os.environ['PYTHONPATH'] = PYTHONPATH
+
+class ProcessingProgress:
+    def __init__(self):
+        self.completed = 0
+        self.total = 0
+        self.failed = 0
+        self.converted = 0
+        self.lock = threading.Lock()
+        self.start_time = time.time()
+
+    def update(self, success=True, converted=False):
+        with self.lock:
+            self.completed += 1
+            if not success:
+                self.failed += 1
+            if converted:
+                self.converted += 1
+            
+            if self.total > 0:
+                progress_pct = (self.completed / self.total) * 100
+                elapsed = time.time() - self.start_time
+                print(f"📊 Progress: {self.completed}/{self.total} ({progress_pct:.0f}%) | "
+                      f"✅ {self.completed - self.failed} | ❌ {self.failed} | ⏱️ {elapsed:.1f}s")
+
+    def reset(self):
+        self.completed = 0
+        self.total = 0
+        self.failed = 0
+        self.converted = 0
+        self.start_time = time.time()
+
+progress = ProcessingProgress()
+
+def print_status(message, status="info"):
+    colors = {"success": "#4CAF50", "info": "#2196F3", "warning": "#FF9800", "error": "#F44336"}
+    icons = {"success": "✓", "info": "🔄", "warning": "⚠️", "error": "✗"}
     
-    sys.path.insert(0, '/tmp')
-    from autopre_dock import MolecularPreprocessor, print_status
+    color = colors.get(status, colors["info"])
+    icon = icons.get(status, "🔄")
     
-    preprocessor = MolecularPreprocessor()
-    
-    if not preprocessor.upload_files():
-        sys.exit(1)
-    
-    input_files = preprocessor.list_input_files()
-    
-    if not input_files:
-        print_status("No valid input files found", "error")
-        sys.exit(1)
-    
-    if processing_mode == "Prepare Receptors (PDB → PDBQT)":
-        pdb_files = [f for f in input_files if f.endswith('.pdb')]
-        if pdb_files:
-            results = preprocessor.prepare_receptor_batch(pdb_files, remove_water, remove_nonstd)
-            preprocessor.generate_summary(results)
-            preprocessor.download_results("*.pdbqt")
-        else:
-            print_status("No PDB files found for receptor preparation", "warning")
-    
-    elif processing_mode == "Prepare Ligands (→ PDBQT)":
-        ligand_files = [f for f in input_files if not f.endswith('.pdbqt')]
-        if ligand_files:
-            results = preprocessor.prepare_ligand_batch(ligand_files, auto_convert)
-            preprocessor.generate_summary(results)
-            preprocessor.download_results("*.pdbqt")
-        else:
-            print_status("No ligand files found", "warning")
-    
-    elif processing_mode == "Convert Format Only":
-        results = preprocessor.batch_convert(input_files, output_format)
-        preprocessor.generate_summary(results)
-        preprocessor.download_results(f"*.{output_format}")
-    
-    elif processing_mode == "Interactive Mode":
-        print_status("Interactive mode activated. Use preprocessor object for custom operations.", "info")
-        print("\nAvailable methods:")
-        print("  - preprocessor.prepare_receptor_batch(pdb_files)")
-        print("  - preprocessor.prepare_ligand_batch(ligand_files)")
-        print("  - preprocessor.batch_convert(files, format)")
-        print("  - preprocessor.download_results(pattern)")
+    display(HTML(f"""
+    <div style='padding:8px; margin:5px 0; border-radius:4px; 
+                background-color:{color}20; border-left:5px solid {color};'>
+        <span style='color:{color}; font-weight:bold;'>{icon} </span>{message}
+    </div>
+    """))
+
+# ==================== Receptor Processing ====================
+
+def process_single_receptor(receptor_file, output_dir):
+    try:
+        filename = Path(receptor_file).stem
+        output_path = os.path.join(output_dir, f"{filename}.pdbqt")
         
-else:
-    print("❌ Failed to download preprocessing script")
-    print("Manual download: https://github.com/BCBT-tust/ZymEvo-RCGB/blob/main/autopre-dock.py"")
+        cmd = [
+            MGLTOOLS_PATH, PREPARE_RECEPTOR,
+            "-r", receptor_file,
+            "-o", output_path,
+            "-A", "hydrogens",
+            "-U", "nphs_lps_waters"
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, 
+                              env=os.environ, timeout=300)
+        
+        if result.returncode == 0 and os.path.exists(output_path):
+            progress.update(success=True)
+            return output_path, None
+        else:
+            error_msg = result.stderr.strip() or "Unknown error"
+            progress.update(success=False)
+            return None, error_msg
+            
+    except subprocess.TimeoutExpired:
+        progress.update(success=False)
+        return None, "Timeout (>5 min)"
+    except Exception as e:
+        progress.update(success=False)
+        return None, str(e)
+
+def batch_process_receptors(uploaded_files, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    
+    progress.total = len(uploaded_files)
+    print(f"🚀 Processing {len(uploaded_files)} receptor(s)...")
+    
+    successful = []
+    failed = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_file = {
+            executor.submit(process_single_receptor, filename, output_dir): filename
+            for filename in uploaded_files.keys()
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_file):
+            filename = future_to_file[future]
+            try:
+                output_path, error = future.result()
+                if output_path:
+                    successful.append(output_path)
+                else:
+                    failed.append((filename, error))
+            except Exception as e:
+                failed.append((filename, str(e)))
+    
+    return successful, failed
+
+# ==================== Ligand Processing ====================
+
+def setup_openbabel():
+    """Setup OpenBabel using system package manager (apt-get)"""
+    try:
+        result = subprocess.run(['obabel', '-V'], capture_output=True)
+        if result.returncode == 0:
+            print_status("OpenBabel already available", "success")
+            return True
+    except:
+        pass
+    
+    print_status("Installing OpenBabel via apt-get...", "info")
+    try:
+        subprocess.run(['apt-get', 'update', '-qq'], check=True, timeout=60)
+        subprocess.run(['apt-get', 'install', '-y', 'openbabel', 'python3-openbabel'], 
+                      check=True, timeout=180)
+        
+        result = subprocess.run(['obabel', '-V'], capture_output=True, text=True)
+        if result.returncode == 0:
+            version = result.stdout.strip().split('\n')[0]
+            print_status(f"OpenBabel installed: {version}", "success")
+            return True
+        else:
+            print_status("OpenBabel installation verification failed", "error")
+            return False
+            
+    except Exception as e:
+        print_status(f"OpenBabel installation failed: {e}", "error")
+        return False
+
+def convert_to_pdb_openbabel(input_file, output_dir, clean_filename):
+    try:
+        pdb_file = os.path.join(output_dir, f"{clean_filename}.pdb")
+        
+        # Use obabel command-line tool with 3D coordinate generation
+        cmd = ['obabel', input_file, '-O', pdb_file, '--gen3d']
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        
+        if result.returncode == 0 and os.path.exists(pdb_file) and os.path.getsize(pdb_file) > 50:
+            return pdb_file, None
+        else:
+            error_msg = result.stderr.strip() or "OpenBabel conversion failed"
+            return None, error_msg
+            
+    except subprocess.TimeoutExpired:
+        return None, "OpenBabel timeout (>60s)"
+    except Exception as e:
+        return None, f"OpenBabel error: {str(e)}"
+
+def fix_pdb_file(pdb_file):
+    try:
+        with open(pdb_file, 'r') as f:
+            lines = f.readlines()
+        
+        fixed_lines = []
+        atom_count = 0
+        has_issues = False
+        
+        for line in lines:
+            if line.startswith('HETATM'):
+                line = 'ATOM  ' + line[6:]
+                has_issues = True
+                atom_count += 1
+            elif line.startswith('ATOM'):
+                atom_count += 1
+            
+            if line.startswith(('CONECT', 'MASTER', 'SSBOND', 'LINK', 'CISPEP')):
+                has_issues = True
+                continue
+
+            if line.startswith('END'):
+                if not any(l.startswith('TER') for l in fixed_lines):
+                    fixed_lines.append(f"TER   {atom_count+1:5d}      UNL A   1\n")
+                    has_issues = True
+            
+            fixed_lines.append(line)
+        
+        if has_issues:
+            with open(pdb_file, 'w') as f:
+                f.writelines(fixed_lines)
+            return True
+        return False
+        
+    except Exception:
+        return False
+
+def process_single_ligand(input_file, output_dir):
+    """Process a single ligand file with OpenBabel conversion"""
+    try:
+        original_name = Path(input_file).name
+        clean_name = Path(input_file).stem
+        
+        import re
+        clean_name = re.sub(r'[^a-zA-Z0-9_-]', '_', clean_name)
+        clean_name = re.sub(r'_+', '_', clean_name).strip('_')
+        
+        file_ext = Path(input_file).suffix.lower()
+        
+        print(f"\n🔄 Processing {original_name}")
+        
+        converted = False
+        
+        if file_ext == '.pdb':
+            # PDB file - copy and fix
+            work_file = os.path.join(output_dir, f"{clean_name}.pdb")
+            shutil.copy2(input_file, work_file)
+            pdb_file = work_file
+            fixed = fix_pdb_file(pdb_file)
+            if fixed:
+                print(f"   🔧 Fixed PDB format")
+            print(f"   ✅ PDB format verified")
+            
+        elif file_ext in ['.sdf', '.mol', '.mol2', '.xyz', '.cml', '.smi']:
+            # Use OpenBabel for all format conversions
+            pdb_file, error = convert_to_pdb_openbabel(input_file, output_dir, clean_name)
+            if pdb_file is None:
+                progress.update(success=False)
+                return None, f"OpenBabel conversion failed: {error}"
+            converted = True
+            print(f"   ✅ Converted {file_ext.upper()} → PDB (OpenBabel)")
+            
+        else:
+            progress.update(success=False)
+            return None, f"Unsupported format: {file_ext}. Supported: PDB, SDF, MOL, MOL2, XYZ, CML, SMI"
+        
+        if not os.path.exists(pdb_file) or os.path.getsize(pdb_file) < 50:
+            progress.update(success=False)
+            return None, "Invalid PDB file generated"
+        
+        try:
+            with open(pdb_file, 'r') as f:
+                content = f.read()
+            
+            has_atoms = 'ATOM' in content or 'HETATM' in content
+            if not has_atoms:
+                progress.update(success=False)
+                return None, "PDB contains no ATOM records"
+            
+            atom_lines = [line for line in content.split('\n') 
+                         if line.startswith(('ATOM', 'HETATM'))]
+            if len(atom_lines) < 3:
+                progress.update(success=False)
+                return None, f"Too few atoms ({len(atom_lines)})"
+                
+        except Exception as e:
+            progress.update(success=False)
+            return None, f"Cannot read PDB: {str(e)}"
+        
+        output_path = os.path.join(output_dir, f"{clean_name}.pdbqt")
+        abs_pdb = os.path.abspath(pdb_file)
+        abs_output = os.path.abspath(output_path)
+        
+        cmd = [
+            MGLTOOLS_PATH, PREPARE_LIGAND,
+            "-l", abs_pdb,
+            "-o", abs_output,
+            "-A", "hydrogens",
+            "-U", "nphs"
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                              env=os.environ, timeout=300, cwd=output_dir)
+        
+        if result.returncode == 0 and os.path.exists(abs_output):
+            file_size = os.path.getsize(abs_output)
+            print(f"   ✅ Generated PDBQT ({file_size} bytes)")
+            progress.update(success=True, converted=converted)
+            return abs_output, None
+        else:
+            error_msg = result.stderr.strip() or "MGLTools failed"
+            print(f"   ❌ MGLTools: {error_msg[:100]}")
+            progress.update(success=False)
+            return None, error_msg
+            
+    except subprocess.TimeoutExpired:
+        progress.update(success=False)
+        return None, "Timeout (>5 min)"
+    except Exception as e:
+        progress.update(success=False)
+        return None, str(e)
+
+def batch_process_ligands(uploaded_files, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    
+    progress.total = len(uploaded_files)
+    print(f"🚀 Processing {len(uploaded_files)} ligand(s)...")
+    
+    successful = []
+    failed = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_file = {
+            executor.submit(process_single_ligand, filename, output_dir): filename
+            for filename in uploaded_files.keys()
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_file):
+            filename = future_to_file[future]
+            try:
+                output_path, error = future.result()
+                if output_path:
+                    successful.append(output_path)
+                else:
+                    failed.append((filename, error))
+            except Exception as e:
+                failed.append((filename, str(e)))
+    
+    return successful, failed
+
+def show_summary(successful, failed, file_type):
+    """Display processing summary"""
+    total_time = time.time() - progress.start_time
+    
+    print(f"\n{'='*60}")
+    print(f"📋 {file_type} Processing Summary")
+    print(f"{'='*60}")
+    print(f"✅ Successfully processed: {len(successful)} files")
+    print(f"❌ Failed: {len(failed)} files")
+    if hasattr(progress, 'converted') and progress.converted > 0:
+        print(f"🔄 Format conversions: {progress.converted} files")
+    print(f"⏱️  Total time: {total_time:.1f}s")
+    
+    if failed:
+        print(f"\n⚠️  Failed files:")
+        for i, (filename, error) in enumerate(failed[:5], 1):
+            print(f"   {i}. {filename}: {error}")
+        if len(failed) > 5:
+            print(f"   ... and {len(failed) - 5} more")
+
+def create_package(file_type, output_dir):
+    try:
+        archive_name = f"zymevo_{file_type}"
+        shutil.make_archive(archive_name, 'zip', output_dir)
+        zip_file = f"{archive_name}.zip"
+        if os.path.exists(zip_file):
+            return zip_file
+    except Exception as e:
+        print(f"❌ Packaging failed: {e}")
+    return None
+
+def main():
+    """Main unified preprocessing function"""
+    
+    display(HTML("""
+    <div style="text-align:center; padding:15px; background-color:#f0f7ff; border-radius:8px;">
+        <h2 style="color:#1a5fb4;">🧬 ZymEvo Unified Preprocessing</h2>
+        <p>Batch processing for receptors and ligands</p>
+    </div>
+    """))
+
+    print("\n📋 Select processing type:")
+    print("  1️⃣  Receptor preprocessing (PDB → PDBQT)")
+    print("  2️⃣  Ligand preprocessing (SDF/MOL/MOL2/PDB → PDBQT)")
+    print("  3️⃣  Both (receptors + ligands)")
+    
+    choice = input("\nEnter choice (1/2/3): ").strip()
+    
+    # Setup OpenBabel for ligand processing
+    openbabel_ready = False
+    if choice in ['2', '3']:
+        openbabel_ready = setup_openbabel()
+        if not openbabel_ready:
+            print_status("⚠️  OpenBabel not available. Only PDB ligands can be processed.", "warning")
+    
+    all_successful = []
+    all_failed = []
+    
+    if choice in ['1', '3']:
+        print("\n" + "="*60)
+        print("🧪 RECEPTOR PREPROCESSING")
+        print("="*60)
+        print("📤 Upload receptor files (.pdb)...")
+        
+        receptor_files = files.upload()
+        if receptor_files:
+            progress.reset()
+            successful, failed = batch_process_receptors(receptor_files, 'processed_receptors')
+            show_summary(successful, failed, "Receptor")
+            all_successful.extend(successful)
+            all_failed.extend(failed)
+            
+            if successful:
+                pkg = create_package("receptors", "processed_receptors")
+                if pkg:
+                    print(f"\n📥 Downloading {len(successful)} receptor(s)...")
+                    files.download(pkg)
+                    print_status(f"✓ Downloaded: {pkg}", "success")
+    
+    if choice in ['2', '3']:
+        print("\n" + "="*60)
+        print("💊 LIGAND PREPROCESSING")
+        print("="*60)
+        
+        if openbabel_ready:
+            print("✅ OpenBabel ready - all formats supported")
+            print("📋 Supported: PDB, SDF, MOL, MOL2, XYZ, CML, SMI")
+        else:
+            print("⚠️  Only PDB format supported (OpenBabel unavailable)")
+        
+        print("\n📤 Upload ligand files...")
+        
+        ligand_files = files.upload()
+        if ligand_files:
+            progress.reset()
+            successful, failed = batch_process_ligands(ligand_files, 'processed_ligands')
+            show_summary(successful, failed, "Ligand")
+            all_successful.extend(successful)
+            all_failed.extend(failed)
+            
+            if successful:
+                pkg = create_package("ligands", "processed_ligands")
+                if pkg:
+                    print(f"\n📥 Downloading {len(successful)} ligand(s)...")
+                    files.download(pkg)
+                    print_status(f"✓ Downloaded: {pkg}", "success")
+    
+    if all_successful:
+        display(HTML(f"""
+        <div style="text-align:center; padding:15px; background-color:#e8f5e9; 
+                    border-radius:8px; border:1px solid #4CAF50; margin-top:20px;">
+            <h3 style="color:#2E7D32;">🎉 Processing Complete!</h3>
+            <p><strong>{len(all_successful)}</strong> files processed successfully</p>
+            <p>Ready for molecular docking analysis</p>
+        </div>
+        """))
+    else:
+        display(HTML("""
+        <div style="text-align:center; padding:15px; background-color:#ffebee; 
+                    border-radius:8px; border:1px solid #F44336; margin-top:20px;">
+            <h3 style="color:#C62828;">⚠️ No files processed successfully</h3>
+            <p>Please check error messages above</p>
+        </div>
+        """))
+
+if __name__ == "__main__":
+    main()
