@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-ZymEvo AutoPre-Dock - FIXED VERSION
-Correct parameters for prepare_flexreceptor4.py: -g (not -o)
-"""
 
 import os
 import sys
@@ -18,7 +14,6 @@ class PDBTools:
 
     @staticmethod
     def fix_missing_chain_id(pdb_file: str, chain_id: str = "A") -> bool:
-        """Automatically fix missing chain ID in PDB ATOM/HETATM lines."""
         try:
             with open(pdb_file, "r") as f:
                 lines = f.readlines()
@@ -46,7 +41,6 @@ class PDBTools:
             return False
 
 class Config:
-    """Global configuration for MGLTools paths and environment"""
     
     MGLTOOLS_PATH = "/usr/local/autodocktools/bin/pythonsh"
     PREPARE_RECEPTOR = "/usr/local/autodocktools/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_receptor4.py"
@@ -85,7 +79,7 @@ class PDBQTValidator:
     @staticmethod
     def validate_and_fix(pdbqt_file: str, verbose: bool = True, 
                         is_flexible_part: bool = False) -> Tuple[bool, str]:
-        """Validate and fix PDBQT files."""
+
         if not os.path.exists(pdbqt_file):
             return False, "File not found"
         
@@ -314,21 +308,18 @@ class ReceptorProcessor:
     
     def _make_flexible(self, base_pdbqt: str, filename: str, 
                       output_dir: str) -> Tuple[List[str], Optional[str]]:
-        """
-        FIXED: Use -g parameter instead of -o for prepare_flexreceptor4.py
-        """
+
         rigid_pdbqt = os.path.join(output_dir, f"{filename}_rigid.pdbqt")
         flex_pdbqt = os.path.join(output_dir, f"{filename}_flex.pdbqt")
         
         os.rename(base_pdbqt, rigid_pdbqt)
         
-        # CRITICAL FIX: Use -g instead of -o
         cmd = [
             Config.MGLTOOLS_PATH,
             Config.PREPARE_FLEXRECEPTOR,
             "-r", rigid_pdbqt,
             "-s", self.flexible_residues,
-            "-g", rigid_pdbqt,  # FIXED: -g not -o!
+            "-g", rigid_pdbqt, 
             "-x", flex_pdbqt
         ]
         
