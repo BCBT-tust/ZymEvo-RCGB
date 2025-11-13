@@ -21,6 +21,7 @@ warnings.filterwarnings('ignore')
 
 @dataclass
 class AtomData:
+    """Protein structure data"""
     coordinates: np.ndarray
     elements: List[str]
     atom_names: List[str]
@@ -30,6 +31,7 @@ class AtomData:
 
 @dataclass
 class DockingParameters:
+    """Optimized docking box parameters"""
     center_x: float
     center_y: float
     center_z: float
@@ -41,12 +43,11 @@ class DockingParameters:
     pocket_score: float
     docking_score: float
     iterations: int
-    optimized_by: str
+    optimized_by: str  # 'mock', 'hybrid', 'vina_only'
 
 
 class VinaInstaller:
     
-    # Direct download links for Vina 1.2.5
     VINA_URLS = {
         'linux': 'https://github.com/ccsb-scripps/AutoDock-Vina/releases/download/v1.2.5/vina_1.2.5_linux_x86_64',
         'darwin': 'https://github.com/ccsb-scripps/AutoDock-Vina/releases/download/v1.2.5/vina_1.2.5_mac_catalina_64bit',
@@ -69,7 +70,7 @@ class VinaInstaller:
     
     @staticmethod
     def download_vina(output_dir: str = '.') -> Optional[str]:
-        """Download AutoDock Vina executable"""
+        """Download Vina executable"""
         system = platform.system().lower()
         
         if system not in VinaInstaller.VINA_URLS:
@@ -80,18 +81,17 @@ class VinaInstaller:
         vina_name = 'vina' if system != 'windows' else 'vina.exe'
         vina_path = os.path.join(output_dir, vina_name)
         
-        print(f"📥 Downloading Vina v1.2.5 for {system}...")
-        print(f"   URL: {url}")
+        print(f"📥 Downloading Vina v1.2.5...")
         
         try:
             urllib.request.urlretrieve(url, vina_path)
             os.chmod(vina_path, 0o755)
             
             if os.path.exists(vina_path) and os.path.getsize(vina_path) > 1000000:
-                print(f"✅ Vina downloaded: {vina_path}")
+                print(f"✅ Vina ready: {vina_path}")
                 return vina_path
             else:
-                print(f"❌ Download incomplete or corrupted")
+                print(f"❌ Download incomplete")
                 return None
         except Exception as e:
             print(f"❌ Download failed: {e}")
@@ -99,7 +99,7 @@ class VinaInstaller:
     
     @staticmethod
     def ensure_vina(force_download: bool = False) -> Optional[str]:
-        """Ensure Vina is available, download if needed"""
+        """Ensure Vina availability"""
         if not force_download:
             vina_path = VinaInstaller.get_vina_path()
             if vina_path:
@@ -111,6 +111,7 @@ class VinaInstaller:
 
 
 class PDBParser:
+    
     ATOMIC_MASSES = {
         'H': 1.008, 'C': 12.011, 'N': 14.007, 'O': 15.999,
         'S': 32.06, 'P': 30.974, 'F': 18.998, 'CL': 35.45,
@@ -121,6 +122,7 @@ class PDBParser:
     
     @staticmethod
     def parse_pdb(pdb_file: str) -> Optional[AtomData]:
+        """Parse PDB file and extract atom data"""
         if not os.path.exists(pdb_file):
             return None
         
@@ -170,52 +172,51 @@ class PDBParser:
 class MockDockingScorer:
     
     @staticmethod
-    def calculate_mock_score(coords: np.ndarray, center: np.ndarray, box_size: np.ndarray,
-                            elements: List[str], residues: List[str]) -> float:
-        """Calculate mock docking score (lower is better, like kcal/mol)"""
+    def calculate_mock_score(coords: np.ndarray, center: np.ndarray, 
+                            box_size: np.ndarray, elements: List[str], 
+                            residues: List[str]) -> float:
+                                
         distances = np.linalg.norm(coords - center, axis=1)
         nearby_mask = distances < 15.0
         
         if np.sum(nearby_mask) < 5:
             return 0.0
         
-        nearby_coords = coords[nearby_mask]
         nearby_residues = [residues[i] for i in range(len(residues)) if nearby_mask[i]]
         
-        # Pocket depth
-        pocket_depth = len(nearby_coords) / 100.0
+        # Pocket depth score
+        pocket_depth = np.sum(nearby_mask) / 100.0
         
-        # Chemical environment
-        polar_residues = {'ASP', 'GLU', 'LYS', 'ARG', 'HIS', 'SER', 'THR', 'ASN', 'GLN', 'CYS'}
+        # Chemical environment score
+        polar_res = {'ASP', 'GLU', 'LYS', 'ARG', 'HIS', 'SER', 'THR', 'ASN', 'GLN', 'CYS'}
         hydrophobic = {'ALA', 'VAL', 'LEU', 'ILE', 'PHE', 'TRP', 'MET', 'PRO'}
         
-        polar_count = sum(1 for r in nearby_residues if r in polar_residues)
+        polar_count = sum(1 for r in nearby_residues if r in polar_res)
         hydrophobic_count = sum(1 for r in nearby_residues if r in hydrophobic)
         
-        chemical_score = (polar_count * 0.3 + hydrophobic_count * 0.2) / max(len(nearby_residues), 1)
+        chemical = (polar_count * 0.3 + hydrophobic_count * 0.2) / max(len(nearby_residues), 1)
         
-        # Box size penalty
-        volume = np.prod(box_size)
-        size_penalty = volume / 50000.0
-        
-        # Combined score (negative for minimization)
-        score = -(pocket_depth * 2.0 + chemical_score * 3.0 - size_penalty * 0.5)
-        
-        # Scale to kcal/mol range
-        score = max(min(score, 0.0), -15.0)
-        
-        return score
+        volume_penalty = np.prod(box_size) / 50000.0
+
+        score = -(pocket_depth * 2.0 + chemical * 3.0 - volume_penalty * 0.5)
+
+        return max(min(score, 0.0), -15.0)
 
 
-class VinaDockingScorer:    
+class VinaDockingScorer:
+    
     def __init__(self, vina_path: str):
         self.vina_path = vina_path
     
     def run_vina_docking(self, receptor_pdbqt: str, ligand_pdbqt: str,
                         center: np.ndarray, box_size: np.ndarray,
                         exhaustiveness: int = 8) -> Optional[float]:
-        """Run Vina docking and return best score"""
+        """
+        Run Vina docking and return best score
         
+        Returns:
+            float: Best docking score (kcal/mol), or None if failed
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             config_file = os.path.join(tmpdir, 'config.txt')
             output_file = os.path.join(tmpdir, 'output.pdbqt')
@@ -246,8 +247,7 @@ class VinaDockingScorer:
                             parts = line.split()
                             if len(parts) >= 2:
                                 try:
-                                    score = float(parts[1])
-                                    return score
+                                    return float(parts[1])
                                 except:
                                     pass
             except:
@@ -257,9 +257,11 @@ class VinaDockingScorer:
 
 
 class ActiveSiteDetector:
+    
     @staticmethod
     def calculate_pocket_score(coords: np.ndarray, center: np.ndarray, 
                               elements: List[str], residues: List[str]) -> float:
+
         distances = np.linalg.norm(coords - center, axis=1)
         nearby_mask = distances < 15.0
         
@@ -269,23 +271,24 @@ class ActiveSiteDetector:
         nearby_coords = coords[nearby_mask]
         nearby_residues = [residues[i] for i in range(len(residues)) if nearby_mask[i]]
         
-        density = len(nearby_coords) / 4188.79
-        unique_residues = len(set(nearby_residues))
-        diversity = min(unique_residues / 20.0, 1.0)
+        density = len(nearby_coords) / 4188.79  # 15Å sphere volume
         
-        polar_residues = {'ASP', 'GLU', 'LYS', 'ARG', 'HIS', 'SER', 'THR', 'ASN', 'GLN', 'CYS'}
-        polar_count = sum(1 for r in nearby_residues if r in polar_residues)
-        polar_score = min(polar_count / len(nearby_residues), 0.5) if len(nearby_residues) > 0 else 0
+        unique_res = len(set(nearby_residues))
+        diversity = min(unique_res / 20.0, 1.0)
         
+        polar_res = {'ASP', 'GLU', 'LYS', 'ARG', 'HIS', 'SER', 'THR', 'ASN', 'GLN', 'CYS'}
+        polar_count = sum(1 for r in nearby_residues if r in polar_res)
+        polar_score = min(polar_count / len(nearby_residues), 0.5) if nearby_residues else 0
+
         pairwise_dist = cdist(nearby_coords, nearby_coords)
-        avg_internal_dist = np.mean(pairwise_dist[pairwise_dist > 0])
-        concavity = 1.0 / (1.0 + avg_internal_dist / 10.0)
-        
-        score = 0.3 * density + 0.25 * diversity + 0.25 * polar_score + 0.2 * concavity
-        return score
+        avg_dist = np.mean(pairwise_dist[pairwise_dist > 0])
+        concavity = 1.0 / (1.0 + avg_dist / 10.0)
+
+        return 0.3 * density + 0.25 * diversity + 0.25 * polar_score + 0.2 * concavity
     
     @staticmethod
     def find_active_site(atom_data: AtomData) -> Tuple[np.ndarray, float]:
+        
         coords = atom_data.coordinates
         min_coords = np.min(coords, axis=0)
         max_coords = np.max(coords, axis=0)
@@ -296,21 +299,22 @@ class ActiveSiteDetector:
         ca_coords = coords[ca_mask] if any(ca_mask) else coords[::10]
         candidates.extend(ca_coords[:min(50, len(ca_coords))])
         
-        grid_points = 8
-        for i in range(grid_points):
-            for j in range(grid_points):
-                for k in range(grid_points):
+        grid_size = 8
+        for i in range(grid_size):
+            for j in range(grid_size):
+                for k in range(grid_size):
                     point = min_coords + (max_coords - min_coords) * np.array([
-                        i / grid_points, j / grid_points, k / grid_points
+                        i / grid_size, j / grid_size, k / grid_size
                     ])
+                    # Only interior points
                     if np.min(np.linalg.norm(coords - point, axis=1)) < 5.0:
                         candidates.append(point)
         
         candidates = np.array(candidates)
         
         scores = [ActiveSiteDetector.calculate_pocket_score(
-            coords, candidate, atom_data.elements, atom_data.residues
-        ) for candidate in candidates]
+            coords, cand, atom_data.elements, atom_data.residues
+        ) for cand in candidates]
         
         best_idx = np.argmax(scores)
         return candidates[best_idx], scores[best_idx]
@@ -318,16 +322,18 @@ class ActiveSiteDetector:
 
 class BayesianOptimizer:
     
-    def __init__(self, bounds: np.ndarray, acquisition_func: str = 'ei'):
+    def __init__(self, bounds: np.ndarray, acquisition: str = 'ei'):
+
         self.bounds = bounds
         self.n_params = bounds.shape[0]
-        self.acquisition_func = acquisition_func
+        self.acquisition = acquisition
         self.X_samples = []
         self.y_samples = []
     
     def suggest_next_point(self) -> np.ndarray:
-        """Suggest next point using acquisition function"""
+        
         if len(self.X_samples) < 3:
+            # Random exploration for first 3 points
             return np.random.uniform(self.bounds[:, 0], self.bounds[:, 1])
         
         X = np.array(self.X_samples)
@@ -348,12 +354,12 @@ class BayesianOptimizer:
             mu = np.sum(weights * y)
             sigma = np.sqrt(np.sum(weights * (y - mu)**2)) + 1e-6
             
-            if self.acquisition_func == 'ei':
+            if self.acquisition == 'ei':
                 y_best = np.min(y)
                 z = (y_best - mu) / sigma
                 ei = (y_best - mu) * norm.cdf(z) + sigma * norm.pdf(z)
                 acquisition_values.append(ei)
-            else:
+            else:  # ucb
                 kappa = 2.0
                 ucb = mu - kappa * sigma
                 acquisition_values.append(-ucb)
@@ -366,13 +372,14 @@ class BayesianOptimizer:
         self.y_samples.append(y)
     
     def get_best(self) -> Tuple[np.ndarray, float]:
-        if len(self.y_samples) == 0:
+        """Get best observed parameters"""
+        if not self.y_samples:
             return None, None
         best_idx = np.argmin(self.y_samples)
         return np.array(self.X_samples[best_idx]), self.y_samples[best_idx]
 
 
-class MultiOptDockingOptimizer:
+class AutoPocketOptimizer:
     
     def __init__(self, padding: float = 10.0, vina_path: Optional[str] = None):
         self.padding = padding
@@ -387,53 +394,51 @@ class MultiOptDockingOptimizer:
         weighted_coords = atom_data.coordinates * masses[:, np.newaxis]
         return np.sum(weighted_coords, axis=0) / total_mass
     
-    def optimize_with_bayes(self, atom_data: AtomData, 
-                           n_iter: int = 20,
-                           use_vina: bool = False,
-                           hybrid: bool = True,
-                           hybrid_switch: float = 0.5,
-                           receptor_pdbqt: Optional[str] = None,
-                           ligand_pdbqt: Optional[str] = None) -> DockingParameters:
-        
-        initial_center, pocket_score = ActiveSiteDetector.find_active_site(atom_data)
+    def optimize_box(self, atom_data: AtomData, 
+                    n_iter: int = 10,
+                    mode: str = 'mock',
+                    receptor_pdbqt: Optional[str] = None,
+                    ligand_pdbqt: Optional[str] = None,
+                    hybrid_switch: float = 0.5) -> DockingParameters:
+
+        active_center, pocket_score = ActiveSiteDetector.find_active_site(atom_data)
         com = self.calculate_center_of_mass(atom_data)
-        initial_center = 0.7 * initial_center + 0.3 * com
+        
+        initial_center = 0.7 * active_center + 0.3 * com
         
         center_range = 15.0
         bounds = np.array([
             [initial_center[0] - center_range, initial_center[0] + center_range],
             [initial_center[1] - center_range, initial_center[1] + center_range],
             [initial_center[2] - center_range, initial_center[2] + center_range],
-            [15.0, 50.0],
-            [15.0, 50.0],
-            [15.0, 50.0],
+            [15.0, 50.0],  # size_x
+            [15.0, 50.0],  # size_y
+            [15.0, 50.0],  # size_z
         ])
         
-        optimizer = BayesianOptimizer(bounds, acquisition_func='ei')
+        optimizer = BayesianOptimizer(bounds)
         
-        if use_vina and hybrid:
-            mode = "hybrid"
+        if mode == 'hybrid':
             switch_iter = int(n_iter * hybrid_switch)
             print(f"⚙️  Hybrid: {switch_iter} mock → {n_iter - switch_iter} Vina iterations")
-        elif use_vina:
-            mode = "vina_only"
+        elif mode == 'vina':
             print(f"⚙️  Full Vina: {n_iter} iterations")
-        else:
-            mode = "mock_only"
-            print(f"⚙️  Quick mock: {n_iter} iterations")
+        else:  # mock
+            print(f"⚙️  Mock: {n_iter} iterations")
         
         best_score = float('inf')
         best_params = None
         
         for iteration in range(n_iter):
+            # Get next point
             x = optimizer.suggest_next_point()
             center = x[:3]
             box_size = x[3:]
             
             use_vina_now = False
-            if mode == "vina_only":
+            if mode == 'vina':
                 use_vina_now = True
-            elif mode == "hybrid" and iteration >= switch_iter:
+            elif mode == 'hybrid' and iteration >= switch_iter:
                 use_vina_now = True
             
             if use_vina_now and self.vina_scorer and receptor_pdbqt and ligand_pdbqt:
@@ -441,6 +446,7 @@ class MultiOptDockingOptimizer:
                     receptor_pdbqt, ligand_pdbqt, center, box_size, exhaustiveness=8
                 )
                 if score is None:
+                    # Fallback to mock
                     score = MockDockingScorer.calculate_mock_score(
                         atom_data.coordinates, center, box_size,
                         atom_data.elements, atom_data.residues
@@ -488,10 +494,10 @@ class MultiOptDockingOptimizer:
             optimized_by=mode
         )
     
-    def calculate_parameters_simple(self, atom_data: AtomData) -> DockingParameters:
-        initial_center, pocket_score = ActiveSiteDetector.find_active_site(atom_data)
+    def calculate_simple(self, atom_data: AtomData) -> DockingParameters:
+        active_center, pocket_score = ActiveSiteDetector.find_active_site(atom_data)
         com = self.calculate_center_of_mass(atom_data)
-        center = 0.7 * initial_center + 0.3 * com
+        center = 0.7 * active_center + 0.3 * com
         
         coords = atom_data.coordinates
         distances = np.linalg.norm(coords - center, axis=1)
@@ -499,12 +505,12 @@ class MultiOptDockingOptimizer:
         nearby_coords = coords[nearby_mask]
         
         if len(nearby_coords) >= 10:
-            relative_coords = nearby_coords - center
-            percentile_95 = np.percentile(np.abs(relative_coords), 95, axis=0)
-            box_size = 2 * percentile_95 + self.padding
+            relative = nearby_coords - center
+            p95 = np.percentile(np.abs(relative), 95, axis=0)
+            box_size = 2 * p95 + self.padding
         else:
-            relative_coords = coords - center
-            box_size = 2 * np.max(np.abs(relative_coords), axis=0) + self.padding
+            relative = coords - center
+            box_size = 2 * np.max(np.abs(relative), axis=0) + self.padding
         
         box_size = np.maximum(box_size, 15.0)
         box_size = np.minimum(box_size, 50.0)
@@ -531,33 +537,34 @@ class MultiOptDockingOptimizer:
 
 
 class ParameterWriter:
+    
     @staticmethod
     def write_vina_config(params: DockingParameters, output_file: str, 
-                         protein_file: str, padding: float):
+                         protein_name: str, padding: float):
+        """Write Vina-compatible configuration file"""
         try:
             with open(output_file, 'w') as f:
                 f.write("# AutoDock Vina Configuration File\n")
-                f.write(f"# Generated for: {Path(protein_file).name}\n")
-                f.write(f"# Number of atoms: {params.n_atoms}\n")
-                f.write(f"# Docking box volume: {params.box_volume:.2f} A^3\n")
+                f.write(f"# Generated for: {protein_name}\n")
+                f.write(f"# Atoms: {params.n_atoms}\n")
+                f.write(f"# Box volume: {params.box_volume:.2f} ų\n")
                 f.write(f"# Pocket score: {params.pocket_score:.3f}\n")
                 f.write(f"# Docking score: {params.docking_score:.3f} kcal/mol\n")
                 f.write(f"# Optimization: {params.optimized_by} ({params.iterations} iter)\n")
-                f.write(f"# Padding: {padding:.1f} A\n")
-                f.write("#\n# Reference: AutoDock Vina (Trott & Olson, 2010)\n")
-                f.write("# DOI: 10.1002/jcc.21334\n\n")
+                f.write(f"# Padding: {padding:.1f} Å\n")
+                f.write("#\n# Reference: Trott & Olson (2010) J Comput Chem 31:455-461\n\n")
                 
-                f.write("# Docking box center (A)\n")
+                f.write("# Docking box center (Å)\n")
                 f.write(f"center_x = {params.center_x:.3f}\n")
                 f.write(f"center_y = {params.center_y:.3f}\n")
                 f.write(f"center_z = {params.center_z:.3f}\n\n")
                 
-                f.write("# Docking box size (A)\n")
+                f.write("# Docking box size (Å)\n")
                 f.write(f"size_x = {params.size_x:.3f}\n")
                 f.write(f"size_y = {params.size_y:.3f}\n")
                 f.write(f"size_z = {params.size_z:.3f}\n\n")
                 
-                f.write("# Recommended parameters\n")
+                f.write("# Recommended Vina parameters\n")
                 f.write("exhaustiveness = 32\n")
                 f.write("num_modes = 20\n")
                 f.write("energy_range = 4\n")
@@ -572,8 +579,8 @@ class ParameterWriter:
                 f.write("Protein,Center_X,Center_Y,Center_Z,Size_X,Size_Y,Size_Z,"
                        "N_Atoms,Box_Volume,Pocket_Score,Docking_Score,Iterations,Optimized_By\n")
                 
-                for protein_name, params in results:
-                    f.write(f"{protein_name},"
+                for name, params in results:
+                    f.write(f"{name},"
                            f"{params.center_x:.3f},{params.center_y:.3f},{params.center_z:.3f},"
                            f"{params.size_x:.3f},{params.size_y:.3f},{params.size_z:.3f},"
                            f"{params.n_atoms},{params.box_volume:.2f},"
@@ -584,14 +591,13 @@ class ParameterWriter:
             return False
 
 
-def process_single_pdb(pdb_file: str, output_dir: str, 
-                      optimize: bool = False,
-                      n_iter: int = 20,
-                      use_vina: bool = False,
-                      hybrid: bool = True,
-                      vina_path: Optional[str] = None,
-                      padding: float = 10.0) -> Optional[Tuple[str, DockingParameters]]:
-    """Process single PDB file"""
+def process_single_protein(pdb_file: str, output_dir: str, 
+                          mode: str = 'mock',
+                          n_iter: int = 10,
+                          receptor_pdbqt: Optional[str] = None,
+                          ligand_pdbqt: Optional[str] = None,
+                          vina_path: Optional[str] = None,
+                          padding: float = 10.0) -> Optional[Tuple[str, DockingParameters]]:
     protein_name = Path(pdb_file).stem
     
     atom_data = PDBParser.parse_pdb(pdb_file)
@@ -601,54 +607,47 @@ def process_single_pdb(pdb_file: str, output_dir: str,
     
     print(f"\n🔬 Processing: {protein_name}")
     
-    optimizer = MultiOptDockingOptimizer(padding=padding, vina_path=vina_path)
+    optimizer = AutoPocketOptimizer(padding=padding, vina_path=vina_path)
     
-    if optimize:
-        params = optimizer.optimize_with_bayes(
-            atom_data, n_iter=n_iter, use_vina=use_vina, hybrid=hybrid
+    if mode != 'mock' or n_iter > 0:
+        params = optimizer.optimize_box(
+            atom_data, n_iter=n_iter, mode=mode,
+            receptor_pdbqt=receptor_pdbqt, ligand_pdbqt=ligand_pdbqt
         )
     else:
-        params = optimizer.calculate_parameters_simple(atom_data)
+        params = optimizer.calculate_simple(atom_data)
     
     output_file = os.path.join(output_dir, f"{protein_name}_docking_params.txt")
-    success = ParameterWriter.write_vina_config(params, output_file, pdb_file, padding)
+    success = ParameterWriter.write_vina_config(params, output_file, protein_name, padding)
     
     if success:
-        print(f"  ✓ Score: {params.docking_score:.3f}, Mode: {params.optimized_by}")
+        print(f"  ✓ Score: {params.docking_score:.3f}, Pocket: {params.pocket_score:.3f}")
         return (protein_name, params)
     return None
 
 
-def batch_process_pdbs(pdb_files: List[str], output_dir: str, 
-                      optimize: bool = False,
-                      n_iter: int = 20,
-                      use_vina: bool = False,
-                      hybrid: bool = True,
-                      vina_path: Optional[str] = None,
-                      padding: float = 10.0,
-                      n_workers: int = 1) -> List[Tuple[str, DockingParameters]]:
+def batch_process(pdb_files: List[str], output_dir: str,
+                 mode: str = 'mock',
+                 n_iter: int = 10,
+                 receptor_pdbqts: Optional[Dict[str, str]] = None,
+                 ligand_pdbqt: Optional[str] = None,
+                 vina_path: Optional[str] = None,
+                 padding: float = 10.0,
+                 n_workers: int = 1) -> List[Tuple[str, DockingParameters]]:
+
     os.makedirs(output_dir, exist_ok=True)
     results = []
     
-    if n_workers > 1 and len(pdb_files) > 1 and not optimize:
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = {
-                executor.submit(process_single_pdb, pdb, output_dir, 
-                              False, n_iter, False, False, vina_path, padding): pdb
-                for pdb in pdb_files
-            }
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    results.append(result)
-    else:
-        for pdb_file in pdb_files:
-            result = process_single_pdb(
-                pdb_file, output_dir, optimize, n_iter, 
-                use_vina, hybrid, vina_path, padding
-            )
-            if result:
-                results.append(result)
+    for pdb_file in pdb_files:
+        protein_name = Path(pdb_file).stem
+        receptor_pdbqt = receptor_pdbqts.get(protein_name) if receptor_pdbqts else None
+        
+        result = process_single_protein(
+            pdb_file, output_dir, mode, n_iter,
+            receptor_pdbqt, ligand_pdbqt, vina_path, padding
+        )
+        if result:
+            results.append(result)
     
     if results:
         summary_file = os.path.join(output_dir, "docking_parameters_summary.csv")
@@ -660,38 +659,41 @@ def batch_process_pdbs(pdb_files: List[str], output_dir: str,
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='MultiOpt Docking Optimizer')
+    parser = argparse.ArgumentParser(
+        description='ZymEvo AutoPocket Finder and Docking Box Optimizer'
+    )
     parser.add_argument('--pdbs', nargs='+', required=True, help='PDB files')
     parser.add_argument('--output', default='docking_params', help='Output directory')
-    parser.add_argument('--mode', choices=['quick', 'hybrid', 'full'], default='quick')
-    parser.add_argument('--optimize', action='store_true', help='Enable optimization')
-    parser.add_argument('--iterations', type=int, default=20, help='Iterations')
-    parser.add_argument('--workers', type=int, default=1, help='Workers')
-    parser.add_argument('--padding', type=float, default=10.0, help='Padding (A)')
+    parser.add_argument('--mode', choices=['mock', 'hybrid', 'vina'], default='mock',
+                       help='Optimization mode')
+    parser.add_argument('--iterations', type=int, default=10, help='Optimization iterations')
+    parser.add_argument('--padding', type=float, default=10.0, help='Box padding (Å)')
+    parser.add_argument('--receptor_pdbqt', help='Receptor PDBQT (for hybrid/vina)')
+    parser.add_argument('--ligand_pdbqt', help='Ligand PDBQT (for hybrid/vina)')
     parser.add_argument('--vina_path', help='Vina executable path')
     parser.add_argument('--download_vina', action='store_true', help='Download Vina')
     
     args = parser.parse_args()
     
-    vina_path = None
-    if args.mode in ['hybrid', 'full'] or args.download_vina:
-        vina_path = VinaInstaller.ensure_vina(force_download=args.download_vina)
-        if not vina_path and args.mode in ['hybrid', 'full']:
+    # Setup Vina if needed
+    vina_path = args.vina_path
+    if args.mode in ['hybrid', 'vina'] or args.download_vina:
+        if not vina_path:
+            vina_path = VinaInstaller.ensure_vina(args.download_vina)
+        if not vina_path and args.mode in ['hybrid', 'vina']:
             print("⚠️  Vina unavailable, falling back to mock mode")
-    
-    use_vina = args.mode in ['hybrid', 'full'] and vina_path is not None
-    hybrid = args.mode == 'hybrid'
+            args.mode = 'mock'
     
     print(f"\n{'='*70}")
-    print(f"🧬 MultiOpt Docking Optimizer")
+    print(f"🧬 ZymEvo AutoPocket Optimizer")
     print(f"{'='*70}")
     print(f"Mode: {args.mode}")
-    print(f"Optimize: {args.optimize}")
+    print(f"Iterations: {args.iterations}")
     print(f"{'='*70}\n")
     
-    results = batch_process_pdbs(
-        args.pdbs, args.output, args.optimize, args.iterations,
-        use_vina, hybrid, vina_path, args.padding, args.workers
+    results = batch_process(
+        args.pdbs, args.output, args.mode, args.iterations,
+        None, args.ligand_pdbqt, vina_path, args.padding
     )
     
     print(f"\n{'='*70}")
