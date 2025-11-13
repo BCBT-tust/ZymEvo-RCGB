@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+"""
+ZymEvo AutoPocket Finder and Docking Box Optimizer
+===================================================
+Automatic binding pocket detection and docking box parameter optimization
+
+Three Operation Modes:
+1. Mock Mode (Default): PDB only, fast geometric scoring
+2. Hybrid Mode: PDBQT required, Mock→Vina optimization
+3. Full Precision Mode: PDBQT required, pure Vina optimization
+
+Advanced Vina Parameter Tuning:
+For comprehensive optimization including Vina search parameters, use:
+https://github.com/BCBT-tust/ZymEvo-RCGB/blob/main/parameter_optimizer.py
+"""
 
 import os
 import sys
@@ -47,6 +61,7 @@ class DockingParameters:
 
 
 class VinaInstaller:
+    """AutoDock Vina auto-installer"""
     
     VINA_URLS = {
         'linux': 'https://github.com/ccsb-scripps/AutoDock-Vina/releases/download/v1.2.5/vina_1.2.5_linux_x86_64',
@@ -111,6 +126,7 @@ class VinaInstaller:
 
 
 class PDBParser:
+    """PDB file parser with validation"""
     
     ATOMIC_MASSES = {
         'H': 1.008, 'C': 12.011, 'N': 14.007, 'O': 15.999,
@@ -170,12 +186,16 @@ class PDBParser:
 
 
 class MockDockingScorer:
+    """Fast mock scoring based on geometry and chemical features"""
     
     @staticmethod
     def calculate_mock_score(coords: np.ndarray, center: np.ndarray, 
                             box_size: np.ndarray, elements: List[str], 
                             residues: List[str]) -> float:
-                                
+        """
+        Calculate mock docking score (kcal/mol range)
+        Lower score = better binding (like real Vina)
+        """
         distances = np.linalg.norm(coords - center, axis=1)
         nearby_mask = distances < 15.0
         
@@ -196,26 +216,32 @@ class MockDockingScorer:
         
         chemical = (polar_count * 0.3 + hydrophobic_count * 0.2) / max(len(nearby_residues), 1)
         
+        # Box size penalty
         volume_penalty = np.prod(box_size) / 50000.0
-
+        
+        # Combined score (negative for minimization)
         score = -(pocket_depth * 2.0 + chemical * 3.0 - volume_penalty * 0.5)
-
+        
+        # Scale to kcal/mol range [-15, 0]
         return max(min(score, 0.0), -15.0)
 
 
 class VinaDockingScorer:
+    """Real AutoDock Vina docking scorer"""
     
     def __init__(self, vina_path: str):
         self.vina_path = vina_path
     
     def run_vina_docking(self, receptor_pdbqt: str, ligand_pdbqt: str,
                         center: np.ndarray, box_size: np.ndarray,
-                        exhaustiveness: int = 8) -> Optional[float]:
+                        exhaustiveness: int = 8, verbose: bool = False) -> Tuple[Optional[float], str]:
         """
         Run Vina docking and return best score
         
         Returns:
-            float: Best docking score (kcal/mol), or None if failed
+            Tuple[score, error_msg]: 
+                - score: Best docking score (kcal/mol), or None if failed
+                - error_msg: Error description if failed, empty string if success
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             config_file = os.path.join(tmpdir, 'config.txt')
@@ -241,27 +267,58 @@ class VinaDockingScorer:
                     timeout=300
                 )
                 
-                if result.returncode == 0:
+                # Check return code
+                if result.returncode != 0:
+                    error_msg = result.stderr[:200] if result.stderr else "Unknown error"
+                    if verbose:
+                        print(f"      ⚠️  Vina failed (exit code: {result.returncode})")
+                        print(f"      📋 Error: {error_msg}")
+                    return None, f"exit_code_{result.returncode}"
+                
+                # Parse output for score
+                if result.stdout:
                     for line in result.stdout.split('\n'):
                         if 'mode' in line.lower() and '1' in line:
                             parts = line.split()
                             if len(parts) >= 2:
                                 try:
-                                    return float(parts[1])
+                                    score = float(parts[1])
+                                    return score, ""
                                 except:
                                     pass
-            except:
-                pass
+                
+                # No score found in output
+                if verbose:
+                    print(f"      ⚠️  Vina output has no parseable score")
+                return None, "no_score_in_output"
+                
+            except subprocess.TimeoutExpired:
+                if verbose:
+                    print(f"      ⚠️  Vina timeout (>300s)")
+                return None, "timeout"
+            except Exception as e:
+                if verbose:
+                    print(f"      ⚠️  Vina exception: {str(e)[:100]}")
+                return None, f"exception: {str(e)[:50]}"
         
-        return None
+        return None, "unknown_error"
 
 
 class ActiveSiteDetector:
+    """Automatic binding pocket detection"""
     
     @staticmethod
     def calculate_pocket_score(coords: np.ndarray, center: np.ndarray, 
                               elements: List[str], residues: List[str]) -> float:
-
+        """
+        Calculate pocket quality score [0, 1]
+        
+        Components:
+        - Density (30%): atoms per volume
+        - Diversity (25%): unique residue types
+        - Polarity (25%): charged/polar residues
+        - Concavity (20%): geometric shape
+        """
         distances = np.linalg.norm(coords - center, axis=1)
         nearby_mask = distances < 15.0
         
@@ -271,34 +328,46 @@ class ActiveSiteDetector:
         nearby_coords = coords[nearby_mask]
         nearby_residues = [residues[i] for i in range(len(residues)) if nearby_mask[i]]
         
+        # Density
         density = len(nearby_coords) / 4188.79  # 15Å sphere volume
         
+        # Diversity
         unique_res = len(set(nearby_residues))
         diversity = min(unique_res / 20.0, 1.0)
         
+        # Polarity
         polar_res = {'ASP', 'GLU', 'LYS', 'ARG', 'HIS', 'SER', 'THR', 'ASN', 'GLN', 'CYS'}
         polar_count = sum(1 for r in nearby_residues if r in polar_res)
         polar_score = min(polar_count / len(nearby_residues), 0.5) if nearby_residues else 0
-
+        
+        # Concavity
         pairwise_dist = cdist(nearby_coords, nearby_coords)
         avg_dist = np.mean(pairwise_dist[pairwise_dist > 0])
         concavity = 1.0 / (1.0 + avg_dist / 10.0)
-
+        
+        # Combined score
         return 0.3 * density + 0.25 * diversity + 0.25 * polar_score + 0.2 * concavity
     
     @staticmethod
     def find_active_site(atom_data: AtomData) -> Tuple[np.ndarray, float]:
+        """
+        Find most likely active site
         
+        Returns:
+            Tuple[center_coords, pocket_score]
+        """
         coords = atom_data.coordinates
         min_coords = np.min(coords, axis=0)
         max_coords = np.max(coords, axis=0)
         
         candidates = []
         
+        # CA atom sampling
         ca_mask = [name == 'CA' for name in atom_data.atom_names]
         ca_coords = coords[ca_mask] if any(ca_mask) else coords[::10]
         candidates.extend(ca_coords[:min(50, len(ca_coords))])
         
+        # Grid sampling
         grid_size = 8
         for i in range(grid_size):
             for j in range(grid_size):
@@ -312,6 +381,7 @@ class ActiveSiteDetector:
         
         candidates = np.array(candidates)
         
+        # Score all candidates
         scores = [ActiveSiteDetector.calculate_pocket_score(
             coords, cand, atom_data.elements, atom_data.residues
         ) for cand in candidates]
@@ -321,9 +391,14 @@ class ActiveSiteDetector:
 
 
 class BayesianOptimizer:
+    """Bayesian optimization for docking box parameters"""
     
     def __init__(self, bounds: np.ndarray, acquisition: str = 'ei'):
-
+        """
+        Parameters:
+            bounds: (n_params, 2) array of [min, max] for each parameter
+            acquisition: 'ei' (Expected Improvement) or 'ucb' (Upper Confidence Bound)
+        """
         self.bounds = bounds
         self.n_params = bounds.shape[0]
         self.acquisition = acquisition
@@ -331,7 +406,7 @@ class BayesianOptimizer:
         self.y_samples = []
     
     def suggest_next_point(self) -> np.ndarray:
-        
+        """Suggest next point to evaluate"""
         if len(self.X_samples) < 3:
             # Random exploration for first 3 points
             return np.random.uniform(self.bounds[:, 0], self.bounds[:, 1])
@@ -339,12 +414,14 @@ class BayesianOptimizer:
         X = np.array(self.X_samples)
         y = np.array(self.y_samples)
         
+        # Generate candidate points
         n_candidates = 200
         candidates = np.random.uniform(
             self.bounds[:, 0], self.bounds[:, 1], 
             size=(n_candidates, self.n_params)
         )
         
+        # Evaluate acquisition function
         acquisition_values = []
         for candidate in candidates:
             distances = np.linalg.norm(X - candidate, axis=1)
@@ -368,6 +445,7 @@ class BayesianOptimizer:
         return candidates[best_idx]
     
     def add_observation(self, X: np.ndarray, y: float):
+        """Add new observation"""
         self.X_samples.append(X.copy())
         self.y_samples.append(y)
     
@@ -380,6 +458,10 @@ class BayesianOptimizer:
 
 
 class AutoPocketOptimizer:
+    """
+    Main optimizer class
+    Combines pocket detection with Bayesian optimization
+    """
     
     def __init__(self, padding: float = 10.0, vina_path: Optional[str] = None):
         self.padding = padding
@@ -387,6 +469,7 @@ class AutoPocketOptimizer:
         self.vina_scorer = VinaDockingScorer(vina_path) if vina_path else None
     
     def calculate_center_of_mass(self, atom_data: AtomData) -> np.ndarray:
+        """Calculate protein center of mass"""
         masses = np.array([
             PDBParser.ATOMIC_MASSES.get(elem, 12.0) for elem in atom_data.elements
         ])
@@ -394,30 +477,96 @@ class AutoPocketOptimizer:
         weighted_coords = atom_data.coordinates * masses[:, np.newaxis]
         return np.sum(weighted_coords, axis=0) / total_mass
     
+    def validate_docking_box(self, center: np.ndarray, box_size: np.ndarray, 
+                            atom_data: AtomData) -> Tuple[bool, str]:
+        """
+        Validate if docking box parameters are reasonable
+        
+        Returns:
+            Tuple[is_valid, reason]
+        """
+        protein_coords = atom_data.coordinates
+        
+        # Check 1: Center must be near protein
+        distances_to_center = np.linalg.norm(protein_coords - center, axis=1)
+        min_distance = np.min(distances_to_center)
+        
+        if min_distance > 15.0:
+            return False, f"center_too_far (min_dist={min_distance:.1f}Å)"
+        
+        # Check 2: Box must overlap with protein
+        protein_min = np.min(protein_coords, axis=0)
+        protein_max = np.max(protein_coords, axis=0)
+        
+        box_min = center - box_size / 2
+        box_max = center + box_size / 2
+        
+        # Check overlap on each axis
+        overlap_x = box_max[0] > protein_min[0] and box_min[0] < protein_max[0]
+        overlap_y = box_max[1] > protein_min[1] and box_min[1] < protein_max[1]
+        overlap_z = box_max[2] > protein_min[2] and box_min[2] < protein_max[2]
+        
+        if not (overlap_x and overlap_y and overlap_z):
+            return False, "no_overlap_with_protein"
+        
+        # Check 3: Box size must be reasonable
+        if np.any(box_size < 15.0):
+            return False, f"box_too_small (min={np.min(box_size):.1f}Å)"
+        
+        if np.any(box_size > 60.0):
+            return False, f"box_too_large (max={np.max(box_size):.1f}Å)"
+        
+        # Check 4: Box should contain some protein atoms
+        atoms_in_box = np.sum(
+            (protein_coords >= box_min) & (protein_coords <= box_max)
+        ) / 3  # Divide by 3 because we check x,y,z separately
+        
+        if atoms_in_box < 10:
+            return False, f"too_few_atoms_in_box ({int(atoms_in_box)})"
+        
+        return True, "valid"
+    
     def optimize_box(self, atom_data: AtomData, 
                     n_iter: int = 10,
                     mode: str = 'mock',
                     receptor_pdbqt: Optional[str] = None,
                     ligand_pdbqt: Optional[str] = None,
                     hybrid_switch: float = 0.5) -> DockingParameters:
-
+        """
+        Main optimization routine
+        
+        Parameters:
+            atom_data: Parsed protein structure
+            n_iter: Number of optimization iterations
+            mode: 'mock', 'hybrid', or 'vina'
+            receptor_pdbqt: Receptor PDBQT file (required for hybrid/vina)
+            ligand_pdbqt: Ligand PDBQT file (required for hybrid/vina)
+            hybrid_switch: Fraction of iterations before switching to Vina (hybrid mode)
+            
+        Returns:
+            DockingParameters with optimized box
+        """
+        # Step 1: Detect active site
         active_center, pocket_score = ActiveSiteDetector.find_active_site(atom_data)
         com = self.calculate_center_of_mass(atom_data)
         
+        # Blend active site and COM
         initial_center = 0.7 * active_center + 0.3 * com
         
-        center_range = 15.0
+        # Step 2: Define optimization bounds (tighter constraints)
+        center_range = 12.0  # Reduced from 15.0
         bounds = np.array([
             [initial_center[0] - center_range, initial_center[0] + center_range],
             [initial_center[1] - center_range, initial_center[1] + center_range],
             [initial_center[2] - center_range, initial_center[2] + center_range],
-            [15.0, 50.0],  # size_x
-            [15.0, 50.0],  # size_y
-            [15.0, 50.0],  # size_z
+            [18.0, 45.0],  # size_x: increased min from 15, decreased max from 50
+            [18.0, 45.0],  # size_y
+            [18.0, 45.0],  # size_z
         ])
         
         optimizer = BayesianOptimizer(bounds)
         
+        # Determine mode
         if mode == 'hybrid':
             switch_iter = int(n_iter * hybrid_switch)
             print(f"⚙️  Hybrid: {switch_iter} mock → {n_iter - switch_iter} Vina iterations")
@@ -426,8 +575,10 @@ class AutoPocketOptimizer:
         else:  # mock
             print(f"⚙️  Mock: {n_iter} iterations")
         
+        # Step 3: Optimization loop with validation
         best_score = float('inf')
         best_params = None
+        vina_failure_count = 0
         
         for iteration in range(n_iter):
             # Get next point
@@ -435,23 +586,54 @@ class AutoPocketOptimizer:
             center = x[:3]
             box_size = x[3:]
             
+            # Validate parameters first
+            is_valid, reason = self.validate_docking_box(center, box_size, atom_data)
+            
+            if not is_valid:
+                # Invalid box - use mock with penalty
+                score = MockDockingScorer.calculate_mock_score(
+                    atom_data.coordinates, center, box_size,
+                    atom_data.elements, atom_data.residues
+                )
+                score += 5.0  # Penalty for invalid box
+                scorer_used = f"mock(invalid:{reason})"
+                
+                if iteration < 3:  # Show details for first few
+                    print(f"  Iter {iteration+1}/{n_iter}: INVALID BOX ({reason})")
+                    print(f"      Center: ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f})")
+                    print(f"      Size: ({box_size[0]:.1f}, {box_size[1]:.1f}, {box_size[2]:.1f})")
+                
+                optimizer.add_observation(x, score)
+                continue
+            
+            # Determine scorer
             use_vina_now = False
             if mode == 'vina':
                 use_vina_now = True
             elif mode == 'hybrid' and iteration >= switch_iter:
                 use_vina_now = True
             
+            # Evaluate
             if use_vina_now and self.vina_scorer and receptor_pdbqt and ligand_pdbqt:
-                score = self.vina_scorer.run_vina_docking(
-                    receptor_pdbqt, ligand_pdbqt, center, box_size, exhaustiveness=8
+                score, error_msg = self.vina_scorer.run_vina_docking(
+                    receptor_pdbqt, ligand_pdbqt, center, box_size, 
+                    exhaustiveness=8, verbose=(iteration >= switch_iter)
                 )
+                
                 if score is None:
-                    # Fallback to mock
+                    # Vina failed - use mock as fallback
+                    vina_failure_count += 1
                     score = MockDockingScorer.calculate_mock_score(
                         atom_data.coordinates, center, box_size,
                         atom_data.elements, atom_data.residues
                     )
-                    scorer_used = "mock(fallback)"
+                    scorer_used = f"mock(vina_failed:{error_msg})"
+                    
+                    # Show detailed info for failures
+                    print(f"  Iter {iteration+1}/{n_iter}: Vina FAILED - {error_msg}")
+                    print(f"      Center: ({center[0]:.1f}, {center[1]:.1f}, {center[2]:.1f})")
+                    print(f"      Size: ({box_size[0]:.1f}, {box_size[1]:.1f}, {box_size[2]:.1f})")
+                    print(f"      Using mock fallback: {score:.3f}")
                 else:
                     scorer_used = "vina"
             else:
@@ -469,6 +651,15 @@ class AutoPocketOptimizer:
             
             print(f"  Iter {iteration+1}/{n_iter}: score={score:.3f} ({scorer_used}), best={best_score:.3f}")
         
+        # Summary
+        if vina_failure_count > 0:
+            print(f"\n⚠️  Vina failures: {vina_failure_count}/{n_iter} iterations")
+            print(f"💡 Common causes:")
+            print(f"   • PDBQT files missing charges/hydrogens")
+            print(f"   • Ligand has no rotatable bonds (TORSDOF=0)")
+            print(f"   • Box parameters out of reasonable range")
+        
+        # Step 4: Extract final parameters
         final_center = best_params[:3]
         final_box_size = best_params[3:]
         
@@ -495,6 +686,7 @@ class AutoPocketOptimizer:
         )
     
     def calculate_simple(self, atom_data: AtomData) -> DockingParameters:
+        """Fast calculation without optimization"""
         active_center, pocket_score = ActiveSiteDetector.find_active_site(atom_data)
         com = self.calculate_center_of_mass(atom_data)
         center = 0.7 * active_center + 0.3 * com
@@ -537,6 +729,7 @@ class AutoPocketOptimizer:
 
 
 class ParameterWriter:
+    """Write optimized parameters to files"""
     
     @staticmethod
     def write_vina_config(params: DockingParameters, output_file: str, 
@@ -574,6 +767,7 @@ class ParameterWriter:
     
     @staticmethod
     def write_csv_summary(results: List[Tuple[str, DockingParameters]], output_file: str):
+        """Write summary CSV"""
         try:
             with open(output_file, 'w') as f:
                 f.write("Protein,Center_X,Center_Y,Center_Z,Size_X,Size_Y,Size_Z,"
@@ -598,8 +792,10 @@ def process_single_protein(pdb_file: str, output_dir: str,
                           ligand_pdbqt: Optional[str] = None,
                           vina_path: Optional[str] = None,
                           padding: float = 10.0) -> Optional[Tuple[str, DockingParameters]]:
+    """Process single protein"""
     protein_name = Path(pdb_file).stem
     
+    # Parse PDB
     atom_data = PDBParser.parse_pdb(pdb_file)
     if atom_data is None:
         print(f"  ❌ Failed to parse: {protein_name}")
@@ -607,8 +803,10 @@ def process_single_protein(pdb_file: str, output_dir: str,
     
     print(f"\n🔬 Processing: {protein_name}")
     
+    # Initialize optimizer
     optimizer = AutoPocketOptimizer(padding=padding, vina_path=vina_path)
     
+    # Optimize or simple calculation
     if mode != 'mock' or n_iter > 0:
         params = optimizer.optimize_box(
             atom_data, n_iter=n_iter, mode=mode,
@@ -617,6 +815,7 @@ def process_single_protein(pdb_file: str, output_dir: str,
     else:
         params = optimizer.calculate_simple(atom_data)
     
+    # Write output
     output_file = os.path.join(output_dir, f"{protein_name}_docking_params.txt")
     success = ParameterWriter.write_vina_config(params, output_file, protein_name, padding)
     
@@ -634,10 +833,11 @@ def batch_process(pdb_files: List[str], output_dir: str,
                  vina_path: Optional[str] = None,
                  padding: float = 10.0,
                  n_workers: int = 1) -> List[Tuple[str, DockingParameters]]:
-
+    """Batch process multiple proteins"""
     os.makedirs(output_dir, exist_ok=True)
     results = []
     
+    # Sequential processing (parallel for mock only if needed)
     for pdb_file in pdb_files:
         protein_name = Path(pdb_file).stem
         receptor_pdbqt = receptor_pdbqts.get(protein_name) if receptor_pdbqts else None
@@ -649,6 +849,7 @@ def batch_process(pdb_files: List[str], output_dir: str,
         if result:
             results.append(result)
     
+    # Write summary
     if results:
         summary_file = os.path.join(output_dir, "docking_parameters_summary.csv")
         ParameterWriter.write_csv_summary(results, summary_file)
