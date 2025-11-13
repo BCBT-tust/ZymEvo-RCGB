@@ -10,6 +10,46 @@ from pathlib import Path
 from typing import Tuple, List, Dict, Optional, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+class PDBTools:
+
+    @staticmethod
+    def fix_missing_chain_id(pdb_file: str, chain_id: str = "A") -> bool:
+        """
+        Automatically fix missing chain ID in PDB ATOM/HETATM lines.
+        Returns:
+            True  = chain ID was modified
+            False = no modification needed
+        """
+
+        try:
+            with open(pdb_file, "r") as f:
+                lines = f.readlines()
+
+            fixed = []
+            changed = False
+
+            for line in lines:
+                if line.startswith(("ATOM", "HETATM")):
+                    # Chain ID column is position 22 (index 21)
+                    if len(line) >= 22:
+                        chain_char = line[21]
+
+                        # Missing chain ID → fix
+                        if chain_char in (" ", "_"):
+                            line = line[:21] + chain_id + line[22:]
+                            changed = True
+
+                fixed.append(line)
+
+            if changed:
+                with open(pdb_file, "w") as f:
+                    f.writelines(fixed)
+
+            return changed
+
+        except Exception as e:
+            print(f"[ChainFix] Error fixing chain ID: {e}")
+            return False
 
 class Config:
     """Global configuration for MGLTools paths and environment"""
@@ -200,62 +240,72 @@ class PDBQTValidator:
 
 
 class ReceptorProcessor:
-    
-    def __init__(self, mode: str = 'rigid', 
+
+    def __init__(self, mode: str = 'rigid',
                  flexible_residues: Optional[str] = None,
                  verbose: bool = True):
 
         self.mode = mode.lower()
-        self.flexible_residues = flexible_residues
         self.verbose = verbose
-        
+
+        # Normalize flexible residue list
+        if flexible_residues:
+            self.flexible_residues = (
+                flexible_residues.replace(",", " ")
+                                 .replace(":", " ")
+                                 .replace(";", " ")
+                                 .replace("\t", " ")
+                                 .strip()
+            )
+        else:
+            self.flexible_residues = None
+
         if self.mode not in ['rigid', 'flexible']:
-            raise ValueError(f"Invalid mode: {mode}. Use 'rigid' or 'flexible'")
-        
-        if self.mode == 'flexible' and not flexible_residues:
-            raise ValueError("flexible_residues required for flexible mode")
-        
+            raise ValueError("mode must be rigid or flexible")
+
+        if self.mode == 'flexible' and not self.flexible_residues:
+            raise ValueError("flexible residues required in flexible mode")
+
         Config.setup_environment()
-    
+
     def process(self, receptor_file: str, output_dir: str) -> Tuple[List[str], Optional[str]]:
 
-        if not os.path.exists(receptor_file):
-            return None, f"File not found: {receptor_file}"
-        
-        filename = Path(receptor_file).stem
-        os.makedirs(output_dir, exist_ok=True)
-        
-        if self.verbose:
-            print(f"\n🔬 Processing receptor: {filename}")
-            print(f"   Mode: {self.mode}")
-            if self.mode == 'flexible':
-                print(f"   Flexible residues: {self.flexible_residues}")
-        
-        # Step 1: Generate base PDBQT with prepare_receptor4.py
-        temp_pdbqt = os.path.join(output_dir, f"{filename}_temp.pdbqt")
-        
-        success, error = self._run_prepare_receptor(receptor_file, temp_pdbqt)
-        if not success:
-            return None, error
-        
-        # Step 2: Validate and fix TORSDOF
-        success, msg = PDBQTValidator.validate_and_fix(temp_pdbqt, verbose=self.verbose)
-        if not success:
-            return None, f"Validation failed: {msg}"
-        
-        if self.verbose and msg != "OK":
-            print(f"   ✅ {msg}")
-        
-        # Step 3: Handle mode-specific processing
+    chain_fixed = PDBTools.fix_missing_chain_id(receptor_file)
+    if chain_fixed and self.verbose:
+        print(f"   🔧 Chain ID fixed → A ({Path(receptor_file).name})")
+
+    if not os.path.exists(receptor_file):
+        return None, f"File not found: {receptor_file}"
+
+    filename = Path(receptor_file).stem
+    os.makedirs(output_dir, exist_ok=True)
+
+    if self.verbose:
+        print(f"\n🔬 Processing receptor: {filename}")
+        print(f"   Mode: {self.mode}")
         if self.mode == 'flexible':
-            return self._make_flexible(temp_pdbqt, filename, output_dir)
-        else:
-            # Rigid mode: rename to final name
-            final_pdbqt = os.path.join(output_dir, f"{filename}.pdbqt")
-            os.rename(temp_pdbqt, final_pdbqt)
-            if self.verbose:
-                print(f"   ✅ Generated: {filename}.pdbqt")
-            return [final_pdbqt], None
+            print(f"   Flexible: {self.flexible_residues}")
+
+    # Step 1: prepare_receptor4
+    temp_pdbqt = os.path.join(output_dir, f"{filename}_temp.pdbqt")
+
+    ok, err = self._run_prepare_receptor(receptor_file, temp_pdbqt)
+    if not ok:
+        return None, err
+
+    # Step 2: validate
+    ok, msg = PDBQTValidator.validate_and_fix(temp_pdbqt)
+    if not ok:
+        return None, msg
+
+    # Step 3: rigid vs flexible
+    if self.mode == 'rigid':
+        final = os.path.join(output_dir, f"{filename}.pdbqt")
+        os.rename(temp_pdbqt, final)
+        return [final], None
+
+    # Flexible mode
+    return self._make_flexible(temp_pdbqt, filename, output_dir)
     
     def _run_prepare_receptor(self, receptor_file: str, output_pdbqt: str) -> Tuple[bool, Optional[str]]:
         cmd = [
