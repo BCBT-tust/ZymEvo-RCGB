@@ -1,405 +1,854 @@
 #!/usr/bin/env python3
-"""
-ZymEvo Unified Preprocessing Script
-GitHub: https://github.com/BCBT-tust/ZymEvo-RCGB
-Batch processing for receptors and ligands with OpenBabel format conversion
-"""
 
 import os
 import sys
 import subprocess
 import shutil
 import threading
-import concurrent.futures
 import time
 from pathlib import Path
-from IPython.display import HTML, display
-from google.colab import files
-
-# Environment variables
-PYTHONPATH = "/usr/local/autodocktools/MGLToolsPckgs"
-MGLTOOLS_PATH = "/usr/local/autodocktools/bin/pythonsh"
-PREPARE_RECEPTOR = "/usr/local/autodocktools/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_receptor4.py"
-PREPARE_LIGAND = "/usr/local/autodocktools/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_ligand4.py"
-
-os.environ['PYTHONPATH'] = PYTHONPATH
+from typing import Tuple, List, Dict, Optional, Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-# ==================== Progress & Status ====================
-
-class ProcessingProgress:
-    def __init__(self):
-        self.completed = 0
-        self.total = 0
-        self.failed = 0
-        self.converted = 0
-        self.lock = threading.Lock()
-        self.start_time = time.time()
-
-    def update(self, success=True, converted=False):
-        with self.lock:
-            self.completed += 1
-            if not success:
-                self.failed += 1
-            if converted:
-                self.converted += 1
-
-            if self.total > 0:
-                progress_pct = (self.completed / self.total) * 100
-                elapsed = time.time() - self.start_time
-                print(f"📊 Progress: {self.completed}/{self.total} ({progress_pct:.0f}%) | "
-                      f"✅ {self.completed - self.failed} | ❌ {self.failed} | ⏱️ {elapsed:.1f}s")
-
-    def reset(self):
-        self.completed = 0
-        self.total = 0
-        self.failed = 0
-        self.converted = 0
-        self.start_time = time.time()
-
-    def upload_files(self, prompt="📤 Please upload your input files (.pdb, .sdf, .mol, etc.):"):
+class Config:
+    """Global configuration for MGLTools paths and environment"""
+    
+    # MGLTools paths (adjust if needed)
+    MGLTOOLS_PATH = "/usr/local/autodocktools/bin/pythonsh"
+    PREPARE_RECEPTOR = "/usr/local/autodocktools/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_receptor4.py"
+    PREPARE_LIGAND = "/usr/local/autodocktools/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_ligand4.py"
+    PREPARE_FLEXRECEPTOR = "/usr/local/autodocktools/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_flexreceptor4.py"
+    
+    PYTHONPATH = "/usr/local/autodocktools/MGLToolsPckgs"
+    
+    DEFAULT_WORKERS = 4
+    TIMEOUT_SECONDS = 300  # 5 minutes per file
+    
+    @classmethod
+    def setup_environment(cls):
+        """Setup required environment variables"""
+        os.environ['PYTHONPATH'] = cls.PYTHONPATH
+    
+    @classmethod
+    def verify_mgltools(cls) -> Tuple[bool, str]:
+        """Verify MGLTools installation"""
+        if not os.path.exists(cls.MGLTOOLS_PATH):
+            return False, f"MGLTools not found at {cls.MGLTOOLS_PATH}"
+        
+        if not os.path.exists(cls.PREPARE_RECEPTOR):
+            return False, f"prepare_receptor4.py not found"
+        
+        return True, "MGLTools OK"
+    
+    @classmethod
+    def verify_openbabel(cls) -> bool:
+        """Check if OpenBabel is available"""
         try:
-            print(prompt)
-            uploaded = files.upload()
-            if not uploaded:
-                print("⚠️ No files uploaded.")
-                return None
-            print(f"✅ Uploaded {len(uploaded)} file(s): {', '.join(uploaded.keys())}")
-            return uploaded
+            result = subprocess.run(['obabel', '-V'], 
+                                  capture_output=True, 
+                                  timeout=5)
+            return result.returncode == 0
+        except:
+            return False
+
+class PDBQTValidator:
+    
+    @staticmethod
+    def validate_and_fix(pdbqt_file: str, verbose: bool = True) -> Tuple[bool, str]:
+        if not os.path.exists(pdbqt_file):
+            return False, "File not found"
+        
+        try:
+            with open(pdbqt_file, 'r') as f:
+                lines = f.readlines()
+            
+            has_torsdof = False
+            has_atoms = False
+            n_atoms = 0
+            carbon_issues = []
+            torsdof_value = 0
+            
+            for i, line in enumerate(lines):
+                if line.startswith(('ATOM', 'HETATM')):
+                    has_atoms = True
+                    n_atoms += 1
+                    
+                    # Check carbon atom type
+                    if len(line) >= 79:
+                        atom_name = line[12:16].strip()
+                        atom_type = line[77:79].strip()
+                        
+                        # Carbon should be type "A" not "C"
+                        if atom_name.startswith('C') and atom_type == "C":
+                            carbon_issues.append(i)
+                
+                elif line.startswith('TORSDOF'):
+                    has_torsdof = True
+                    try:
+                        torsdof_value = int(line.split()[1])
+                    except:
+                        pass
+            
+            if not has_atoms:
+                return False, "No ATOM records found"
+            
+            needs_fix = False
+            messages = []
+            
+            if carbon_issues:
+                for i in carbon_issues:
+                    lines[i] = lines[i][:77] + " A" + (lines[i][79:] if len(lines[i]) > 79 else "\n")
+                needs_fix = True
+                messages.append(f"Fixed {len(carbon_issues)} carbon atoms (C->A)")
+                if verbose:
+                    print(f"  🔧 Fixed {len(carbon_issues)} carbon atoms")
+            
+            if not has_torsdof:
+                # Receptor vs ligand heuristic
+                if n_atoms > 100:
+                    # Likely receptor -> TORSDOF 0 (rigid)
+                    lines.append("TORSDOF 0\n")
+                    torsdof_value = 0
+                    messages.append("Added TORSDOF 0 (receptor)")
+                    if verbose:
+                        print(f"  ➕ Added TORSDOF 0 (receptor)")
+                else:
+                    # Likely ligand -> count rotatable bonds
+                    torsdof = PDBQTValidator._count_rotatable_bonds(lines)
+                    lines.append(f"TORSDOF {torsdof}\n")
+                    torsdof_value = torsdof
+                    messages.append(f"Added TORSDOF {torsdof} (ligand)")
+                    if verbose:
+                        print(f"  ➕ Added TORSDOF {torsdof} (ligand)")
+                needs_fix = True
+
+            if needs_fix:
+                with open(pdbqt_file, 'w') as f:
+                    f.writelines(lines)
+            
+            # Summary message
+            if messages:
+                message = "; ".join(messages)
+            else:
+                message = f"OK ({n_atoms} atoms, TORSDOF={torsdof_value})"
+            
+            return True, message
+            
         except Exception as e:
-            print(f"❌ Upload failed: {e}")
-            return None
+            return False, f"Validation error: {str(e)}"
+    
+    @staticmethod
+    def _count_rotatable_bonds(lines: List[str]) -> int:
+
+        branch_count = 0
+        
+        for line in lines:
+            if line.startswith('BRANCH'):
+                branch_count += 1
+        
+        # BRANCH count is usually accurate
+        if branch_count > 0:
+            return branch_count
+        
+        # Fallback: conservative estimate
+        # No BRANCH info -> assume rigid or poorly formatted
+        return 0
+    
+    @staticmethod
+    def quick_check(pdbqt_file: str) -> Dict[str, Union[bool, int]]:
+        
+        result = {
+            'has_atoms': False,
+            'has_torsdof': False,
+            'n_atoms': 0,
+            'torsdof_value': 0,
+            'carbon_issues': 0,
+            'is_valid': False
+        }
+        
+        try:
+            with open(pdbqt_file, 'r') as f:
+                lines = f.readlines()
+            
+            for line in lines:
+                if line.startswith(('ATOM', 'HETATM')):
+                    result['has_atoms'] = True
+                    result['n_atoms'] += 1
+                    
+                    if len(line) >= 79:
+                        atom_name = line[12:16].strip()
+                        atom_type = line[77:79].strip()
+                        if atom_name.startswith('C') and atom_type == "C":
+                            result['carbon_issues'] += 1
+                
+                elif line.startswith('TORSDOF'):
+                    result['has_torsdof'] = True
+                    try:
+                        result['torsdof_value'] = int(line.split()[1])
+                    except:
+                        pass
+            
+            result['is_valid'] = (result['has_atoms'] and 
+                                 result['has_torsdof'] and 
+                                 result['carbon_issues'] == 0)
+            
+        except:
+            pass
+        
+        return result
 
 
-def print_status(message, status="info"):
-    """Print colored status messages"""
-    colors = {"success": "#4CAF50", "info": "#2196F3", "warning": "#FF9800", "error": "#F44336"}
-    icons = {"success": "✓", "info": "🔄", "warning": "⚠️", "error": "✗"}
+class ReceptorProcessor:
+    
+    def __init__(self, mode: str = 'rigid', 
+                 flexible_residues: Optional[str] = None,
+                 verbose: bool = True):
 
-    color = colors.get(status, colors["info"])
-    icon = icons.get(status, "🔄")
+        self.mode = mode.lower()
+        self.flexible_residues = flexible_residues
+        self.verbose = verbose
+        
+        if self.mode not in ['rigid', 'flexible']:
+            raise ValueError(f"Invalid mode: {mode}. Use 'rigid' or 'flexible'")
+        
+        if self.mode == 'flexible' and not flexible_residues:
+            raise ValueError("flexible_residues required for flexible mode")
+        
+        Config.setup_environment()
+    
+    def process(self, receptor_file: str, output_dir: str) -> Tuple[List[str], Optional[str]]:
 
-    display(HTML(f"""
-    <div style='padding:8px; margin:5px 0; border-radius:4px; 
-                background-color:{color}20; border-left:5px solid {color};'>
-        <span style='color:{color}; font-weight:bold;'>{icon} </span>{message}
-    </div>
-    """))
-
-
-# ==================== Receptor Processing ====================
-
-def process_single_receptor(receptor_file, output_dir):
-    """Process a single receptor file"""
-    try:
+        if not os.path.exists(receptor_file):
+            return None, f"File not found: {receptor_file}"
+        
         filename = Path(receptor_file).stem
-        output_path = os.path.join(output_dir, f"{filename}.pdbqt")
-
+        os.makedirs(output_dir, exist_ok=True)
+        
+        if self.verbose:
+            print(f"\n🔬 Processing receptor: {filename}")
+            print(f"   Mode: {self.mode}")
+            if self.mode == 'flexible':
+                print(f"   Flexible residues: {self.flexible_residues}")
+        
+        # Step 1: Generate base PDBQT with prepare_receptor4.py
+        temp_pdbqt = os.path.join(output_dir, f"{filename}_temp.pdbqt")
+        
+        success, error = self._run_prepare_receptor(receptor_file, temp_pdbqt)
+        if not success:
+            return None, error
+        
+        # Step 2: Validate and fix TORSDOF
+        success, msg = PDBQTValidator.validate_and_fix(temp_pdbqt, verbose=self.verbose)
+        if not success:
+            return None, f"Validation failed: {msg}"
+        
+        if self.verbose and msg != "OK":
+            print(f"   ✅ {msg}")
+        
+        # Step 3: Handle mode-specific processing
+        if self.mode == 'flexible':
+            return self._make_flexible(temp_pdbqt, filename, output_dir)
+        else:
+            # Rigid mode: rename to final name
+            final_pdbqt = os.path.join(output_dir, f"{filename}.pdbqt")
+            os.rename(temp_pdbqt, final_pdbqt)
+            if self.verbose:
+                print(f"   ✅ Generated: {filename}.pdbqt")
+            return [final_pdbqt], None
+    
+    def _run_prepare_receptor(self, receptor_file: str, output_pdbqt: str) -> Tuple[bool, Optional[str]]:
         cmd = [
-            MGLTOOLS_PATH, PREPARE_RECEPTOR,
+            Config.MGLTOOLS_PATH,
+            Config.PREPARE_RECEPTOR,
             "-r", receptor_file,
-            "-o", output_path,
+            "-o", output_pdbqt,
             "-A", "hydrogens",
             "-U", "nphs_lps_waters"
         ]
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=os.environ,
+                timeout=Config.TIMEOUT_SECONDS
+            )
+            
+            if result.returncode != 0:
+                error = result.stderr.strip() or "Unknown MGLTools error"
+                return False, f"prepare_receptor4 failed: {error[:200]}"
+            
+            if not os.path.exists(output_pdbqt):
+                return False, "Output PDBQT not generated"
+            
+            if os.path.getsize(output_pdbqt) < 100:
+                return False, "Output PDBQT too small (corrupt?)"
+            
+            return True, None
+        
+        except subprocess.TimeoutExpired:
+            return False, f"Timeout (>{Config.TIMEOUT_SECONDS}s)"
+        
+        except Exception as e:
+            return False, f"Exception: {str(e)}"
+    
+    def _make_flexible(self, base_pdbqt: str, filename: str, 
+                      output_dir: str) -> Tuple[List[str], Optional[str]]:
+                          
+        rigid_pdbqt = os.path.join(output_dir, f"{filename}_rigid.pdbqt")
+        flex_pdbqt = os.path.join(output_dir, f"{filename}_flex.pdbqt")
+        
+        # Rename temp to rigid first
+        os.rename(base_pdbqt, rigid_pdbqt)
+        
+        cmd = [
+            Config.MGLTOOLS_PATH,
+            Config.PREPARE_FLEXRECEPTOR,
+            "-r", rigid_pdbqt,
+            "-s", self.flexible_residues,
+            "-o", rigid_pdbqt,  # Updated rigid part
+            "-x", flex_pdbqt    # Flexible part
+        ]
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=os.environ,
+                timeout=Config.TIMEOUT_SECONDS
+            )
+            
+            if result.returncode == 0 and os.path.exists(flex_pdbqt):
+                # Success - validate both files
+                PDBQTValidator.validate_and_fix(rigid_pdbqt, verbose=False)
+                PDBQTValidator.validate_and_fix(flex_pdbqt, verbose=False)
+                
+                if self.verbose:
+                    print(f"   ✅ Generated: {filename}_rigid.pdbqt")
+                    print(f"   ✅ Generated: {filename}_flex.pdbqt")
+                
+                return [rigid_pdbqt, flex_pdbqt], None
+            
+            else:
+                # Flexible generation failed - keep rigid only
+                error = result.stderr.strip()[:200] if result.stderr else "Unknown error"
+                warning = f"Flexible generation failed: {error}"
+                
+                if self.verbose:
+                    print(f"   ⚠️  {warning}")
+                    print(f"   ✅ Kept rigid receptor: {filename}_rigid.pdbqt")
+                
+                return [rigid_pdbqt], warning
+        
+        except subprocess.TimeoutExpired:
+            warning = "Flexible generation timeout - kept rigid only"
+            if self.verbose:
+                print(f"   ⚠️  {warning}")
+            return [rigid_pdbqt], warning
+        
+        except Exception as e:
+            warning = f"Flexible error: {str(e)}"
+            if self.verbose:
+                print(f"   ⚠️  {warning}")
+            return [rigid_pdbqt], warning
 
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                              env=os.environ, timeout=300)
+class LigandProcessor:
+    
+    def __init__(self, verbose: bool = True):
 
-        if result.returncode == 0 and os.path.exists(output_path):
-            progress.update(success=True)
-            return output_path, None
+        self.verbose = verbose
+        Config.setup_environment()
+    
+    def process(self, ligand_file: str, output_dir: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Process single ligand file
+        
+        Args:
+            ligand_file: Input file (PDB, SDF, MOL, MOL2, etc.)
+            output_dir: Output directory
+        
+        Returns:
+            (output_pdbqt, error_message)
+        """
+        if not os.path.exists(ligand_file):
+            return None, f"File not found: {ligand_file}"
+        
+        filename = Path(ligand_file).stem
+        file_ext = Path(ligand_file).suffix.lower()
+        os.makedirs(output_dir, exist_ok=True)
+        
+        if self.verbose:
+            print(f"\n💊 Processing ligand: {filename}{file_ext}")
+        
+        # Step 1: Format conversion if needed
+        if file_ext != '.pdb':
+            pdb_file, error = self._convert_to_pdb(ligand_file, output_dir, filename)
+            if not pdb_file:
+                return None, error
+            work_file = pdb_file
+            if self.verbose:
+                print(f"   🔄 Converted {file_ext.upper()} -> PDB")
         else:
-            error_msg = result.stderr.strip() or "Unknown error"
-            progress.update(success=False)
-            return None, error_msg
+            work_file = ligand_file
+            if self.verbose:
+                print(f"   ✅ PDB format (no conversion needed)")
+        
+        # Step 2: Generate PDBQT with prepare_ligand4.py
+        output_pdbqt = os.path.join(output_dir, f"{filename}.pdbqt")
+        
+        success, error = self._run_prepare_ligand(work_file, output_pdbqt)
+        if not success:
+            return None, error
+        
+        # Step 3: Validate and fix TORSDOF
+        success, msg = PDBQTValidator.validate_and_fix(output_pdbqt, verbose=self.verbose)
+        if not success:
+            return None, f"Validation failed: {msg}"
+        
+        if self.verbose:
+            if msg != "OK":
+                print(f"   ✅ {msg}")
+            print(f"   ✅ Generated: {filename}.pdbqt")
+        
+        return output_pdbqt, None
+    
+    def _convert_to_pdb(self, input_file: str, output_dir: str, 
+                       filename: str) -> Tuple[Optional[str], Optional[str]]:
 
-    except subprocess.TimeoutExpired:
-        progress.update(success=False)
-        return None, "Timeout (>5 min)"
-    except Exception as e:
-        progress.update(success=False)
-        return None, str(e)
-
-
-def batch_process_receptors(uploaded_files, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-
-    progress.total = len(uploaded_files)
-    print(f"🚀 Processing {len(uploaded_files)} receptor(s)...")
-
-    successful, failed = [], []
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        future_to_file = {
-            executor.submit(process_single_receptor, filename, output_dir): filename
-            for filename in uploaded_files.keys()
-        }
-        for future in concurrent.futures.as_completed(future_to_file):
-            filename = future_to_file[future]
-            try:
-                output_path, error = future.result()
-                if output_path:
-                    successful.append(output_path)
-                else:
-                    failed.append((filename, error))
-            except Exception as e:
-                failed.append((filename, str(e)))
-
-    return successful, failed
-
-
-# ==================== Ligand Processing ====================
-
-def setup_openbabel():
-    try:
-        result = subprocess.run(['obabel', '-V'], capture_output=True)
-        if result.returncode == 0:
-            print_status("OpenBabel already available", "success")
-            return True
-    except:
-        pass
-
-    print_status("Installing OpenBabel via apt-get...", "info")
-    try:
-        subprocess.run(['apt-get', 'update', '-qq'], check=True, timeout=60)
-        subprocess.run(['apt-get', 'install', '-y', 'openbabel', 'python3-openbabel'],
-                       check=True, timeout=180)
-        result = subprocess.run(['obabel', '-V'], capture_output=True, text=True)
-        if result.returncode == 0:
-            version = result.stdout.strip().split('\n')[0]
-            print_status(f"OpenBabel installed: {version}", "success")
-            return True
-        else:
-            print_status("OpenBabel installation verification failed", "error")
-            return False
-    except Exception as e:
-        print_status(f"OpenBabel installation failed: {e}", "error")
-        return False
-
-
-def convert_to_pdb_openbabel(input_file, output_dir, clean_filename):
-    try:
-        pdb_file = os.path.join(output_dir, f"{clean_filename}.pdb")
+        pdb_file = os.path.join(output_dir, f"{filename}_converted.pdb")
+        
         cmd = ['obabel', input_file, '-O', pdb_file, '--gen3d']
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode == 0 and os.path.exists(pdb_file) and os.path.getsize(pdb_file) > 50:
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            
+            if result.returncode != 0:
+                error = result.stderr.strip() or "OpenBabel failed"
+                return None, f"Conversion failed: {error[:200]}"
+            
+            if not os.path.exists(pdb_file):
+                return None, "PDB file not generated"
+            
+            if os.path.getsize(pdb_file) < 50:
+                return None, "PDB file too small (corrupt?)"
+            
+            # Fix PDB formatting issues
+            self._fix_pdb_format(pdb_file)
+            
             return pdb_file, None
-        else:
-            return None, result.stderr.strip() or "OpenBabel conversion failed"
-    except subprocess.TimeoutExpired:
-        return None, "OpenBabel timeout (>60 s)"
-    except Exception as e:
-        return None, f"OpenBabel error: {str(e)}"
-
-
-def fix_pdb_file(pdb_file):
-    try:
-        with open(pdb_file, 'r') as f:
-            lines = f.readlines()
-        fixed_lines = []
-        atom_count = 0
-        has_issues = False
-        for line in lines:
-            if line.startswith('HETATM'):
-                line = 'ATOM  ' + line[6:]
-                has_issues = True
-                atom_count += 1
-            elif line.startswith('ATOM'):
-                atom_count += 1
-            if line.startswith(('CONECT', 'MASTER', 'SSBOND', 'LINK', 'CISPEP')):
-                has_issues = True
-                continue
-            if line.startswith('END'):
-                if not any(l.startswith('TER') for l in fixed_lines):
+        
+        except subprocess.TimeoutExpired:
+            return None, "OpenBabel timeout (>60s)"
+        
+        except FileNotFoundError:
+            return None, "OpenBabel not installed (run: apt-get install openbabel)"
+        
+        except Exception as e:
+            return None, f"Conversion error: {str(e)}"
+    
+    def _fix_pdb_format(self, pdb_file: str):
+        """Fix common PDB formatting issues"""
+        try:
+            with open(pdb_file, 'r') as f:
+                lines = f.readlines()
+            
+            fixed_lines = []
+            atom_count = 0
+            has_ter = False
+            
+            for line in lines:
+                # Convert HETATM to ATOM
+                if line.startswith('HETATM'):
+                    line = 'ATOM  ' + line[6:]
+                    atom_count += 1
+                elif line.startswith('ATOM'):
+                    atom_count += 1
+                
+                # Skip problematic records
+                if line.startswith(('CONECT', 'MASTER', 'SSBOND', 'LINK', 'CISPEP')):
+                    continue
+                
+                # Add TER before END if missing
+                if line.startswith('END') and not has_ter:
                     fixed_lines.append(f"TER   {atom_count+1:5d}      UNL A   1\n")
-                    has_issues = True
-            fixed_lines.append(line)
-        if has_issues:
+                    has_ter = True
+                
+                fixed_lines.append(line)
+            
+            # Write back
             with open(pdb_file, 'w') as f:
                 f.writelines(fixed_lines)
-            return True
-        return False
-    except Exception:
-        return False
+        
+        except:
+            pass  # Non-critical, continue even if fix fails
+    
+    def _run_prepare_ligand(self, ligand_file: str, 
+                           output_pdbqt: str) -> Tuple[bool, Optional[str]]:
 
-
-def process_single_ligand(input_file, output_dir):
-    try:
-        original_name = Path(input_file).name
-        clean_name = Path(input_file).stem
-        import re
-        clean_name = re.sub(r'[^a-zA-Z0-9_-]', '_', clean_name)
-        clean_name = re.sub(r'_+', '_', clean_name).strip('_')
-        file_ext = Path(input_file).suffix.lower()
-        print(f"\n🔄 Processing {original_name}")
-        converted = False
-        if file_ext == '.pdb':
-            work_file = os.path.join(output_dir, f"{clean_name}.pdb")
-            shutil.copy2(input_file, work_file)
-            pdb_file = work_file
-            fixed = fix_pdb_file(pdb_file)
-            if fixed:
-                print("   🔧 Fixed PDB format")
-            print("   ✅ PDB format verified")
-        elif file_ext in ['.sdf', '.mol', '.mol2', '.xyz', '.cml', '.smi']:
-            pdb_file, error = convert_to_pdb_openbabel(input_file, output_dir, clean_name)
-            if pdb_file is None:
-                progress.update(success=False)
-                return None, f"OpenBabel conversion failed: {error}"
-            converted = True
-            print(f"   ✅ Converted {file_ext.upper()} → PDB (OpenBabel)")
-        else:
-            progress.update(success=False)
-            return None, f"Unsupported format: {file_ext}"
-        if not os.path.exists(pdb_file) or os.path.getsize(pdb_file) < 50:
-            progress.update(success=False)
-            return None, "Invalid PDB file generated"
-        output_path = os.path.join(output_dir, f"{clean_name}.pdbqt")
-        abs_pdb = os.path.abspath(pdb_file)
-        abs_output = os.path.abspath(output_path)
         cmd = [
-            MGLTOOLS_PATH, PREPARE_LIGAND,
-            "-l", abs_pdb,
-            "-o", abs_output,
+            Config.MGLTOOLS_PATH,
+            Config.PREPARE_LIGAND,
+            "-l", ligand_file,
+            "-o", output_pdbqt,
             "-A", "hydrogens",
             "-U", "nphs"
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                              env=os.environ, timeout=300, cwd=output_dir)
-        if result.returncode == 0 and os.path.exists(abs_output):
-            size = os.path.getsize(abs_output)
-            print(f"   ✅ Generated PDBQT ({size} bytes)")
-            progress.update(success=True, converted=converted)
-            return abs_output, None
-        else:
-            msg = result.stderr.strip() or "MGLTools failed"
-            print(f"   ❌ MGLTools: {msg[:100]}")
-            progress.update(success=False)
-            return None, msg
-    except subprocess.TimeoutExpired:
-        progress.update(success=False)
-        return None, "Timeout (>5 min)"
-    except Exception as e:
-        progress.update(success=False)
-        return None, str(e)
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                env=os.environ,
+                timeout=Config.TIMEOUT_SECONDS
+            )
+            
+            if result.returncode != 0:
+                error = result.stderr.strip() or "Unknown MGLTools error"
+                return False, f"prepare_ligand4 failed: {error[:200]}"
+            
+            if not os.path.exists(output_pdbqt):
+                return False, "Output PDBQT not generated"
+            
+            if os.path.getsize(output_pdbqt) < 100:
+                return False, "Output PDBQT too small (corrupt?)"
+            
+            return True, None
+        
+        except subprocess.TimeoutExpired:
+            return False, f"Timeout (>{Config.TIMEOUT_SECONDS}s)"
+        
+        except Exception as e:
+            return False, f"Exception: {str(e)}"
 
 
-def batch_process_ligands(uploaded_files, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    progress.total = len(uploaded_files)
-    print(f"🚀 Processing {len(uploaded_files)} ligand(s)...")
-    successful, failed = [], []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        future_to_file = {
-            executor.submit(process_single_ligand, filename, output_dir): filename
-            for filename in uploaded_files.keys()
+class BatchProcessor:
+    
+    def __init__(self, n_workers: int = None, verbose: bool = True):
+        """
+        Initialize batch processor
+        
+        Args:
+            n_workers: Number of parallel workers (default: Config.DEFAULT_WORKERS)
+            verbose: Print detailed progress
+        """
+        self.n_workers = n_workers or Config.DEFAULT_WORKERS
+        self.verbose = verbose
+        
+        # Thread-safe counters
+        self.lock = threading.Lock()
+        self.completed = 0
+        self.total = 0
+        self.failed = 0
+        self.start_time = 0
+    
+    def process_receptors(self, 
+                         receptor_files: List[str],
+                         output_dir: str,
+                         mode: str = 'rigid',
+                         flexible_residues: Optional[str] = None) -> Dict:
+
+        self._reset_counters()
+        self.total = len(receptor_files)
+        self.start_time = time.time()
+        
+        if self.verbose:
+            print(f"\n{'='*60}")
+            print(f"🚀 Batch Receptor Processing")
+            print(f"{'='*60}")
+            print(f"Files: {self.total}")
+            print(f"Mode: {mode}")
+            if mode == 'flexible':
+                print(f"Flexible residues: {flexible_residues}")
+            print(f"Workers: {self.n_workers}")
+            print(f"{'='*60}\n")
+        
+        processor = ReceptorProcessor(
+            mode=mode,
+            flexible_residues=flexible_residues,
+            verbose=False  # Individual verbose handled in callback
+        )
+        
+        successful = []
+        failed = []
+        flexible_count = 0
+        
+        with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
+            future_to_file = {
+                executor.submit(processor.process, file, output_dir): file
+                for file in receptor_files
+            }
+            
+            for future in as_completed(future_to_file):
+                filename = future_to_file[future]
+                
+                with self.lock:
+                    self.completed += 1
+                
+                try:
+                    output_files, error = future.result()
+                    
+                    if output_files:
+                        successful.extend(output_files)
+                        
+                        if len(output_files) > 1:
+                            flexible_count += 1
+                        
+                        if self.verbose:
+                            print(f"✅ {Path(filename).name}: {len(output_files)} file(s)")
+                    else:
+                        failed.append((filename, error))
+                        with self.lock:
+                            self.failed += 1
+                        
+                        if self.verbose:
+                            print(f"❌ {Path(filename).name}: {error}")
+                
+                except Exception as e:
+                    failed.append((filename, f"Exception: {str(e)}"))
+                    with self.lock:
+                        self.failed += 1
+                    
+                    if self.verbose:
+                        print(f"❌ {Path(filename).name}: Exception - {str(e)}")
+                
+                # Progress
+                if self.verbose:
+                    self._print_progress()
+        
+        elapsed = time.time() - self.start_time
+        
+        if self.verbose:
+            self._print_summary("Receptor", len(successful), len(failed), flexible_count, elapsed)
+        
+        return {
+            'successful': successful,
+            'failed': failed,
+            'stats': {
+                'completed': self.completed,
+                'failed': self.failed,
+                'flexible_count': flexible_count,
+                'elapsed_time': elapsed
+            }
         }
-        for future in concurrent.futures.as_completed(future_to_file):
-            filename = future_to_file[future]
-            try:
-                output_path, error = future.result()
-                if output_path:
-                    successful.append(output_path)
-                else:
-                    failed.append((filename, error))
-            except Exception as e:
-                failed.append((filename, str(e)))
-    return successful, failed
+    
+    def process_ligands(self,
+                       ligand_files: List[str],
+                       output_dir: str) -> Dict:
+                           
+        self._reset_counters()
+        self.total = len(ligand_files)
+        self.start_time = time.time()
+        
+        if self.verbose:
+            print(f"\n{'='*60}")
+            print(f"🚀 Batch Ligand Processing")
+            print(f"{'='*60}")
+            print(f"Files: {self.total}")
+            print(f"Workers: {self.n_workers}")
+            print(f"{'='*60}\n")
+        
+        processor = LigandProcessor(verbose=False)
+        
+        successful = []
+        failed = []
+        converted = 0
+        
+        with ThreadPoolExecutor(max_workers=self.n_workers) as executor:
+            future_to_file = {
+                executor.submit(processor.process, file, output_dir): file
+                for file in ligand_files
+            }
+            
+            for future in as_completed(future_to_file):
+                filename = future_to_file[future]
+                
+                with self.lock:
+                    self.completed += 1
+                
+                try:
+                    output_file, error = future.result()
+                    
+                    if output_file:
+                        successful.append(output_file)
+                        
+                        # Check if conversion happened
+                        if Path(filename).suffix.lower() != '.pdb':
+                            converted += 1
+                        
+                        if self.verbose:
+                            print(f"✅ {Path(filename).name}")
+                    else:
+                        failed.append((filename, error))
+                        with self.lock:
+                            self.failed += 1
+                        
+                        if self.verbose:
+                            print(f"❌ {Path(filename).name}: {error}")
+                
+                except Exception as e:
+                    failed.append((filename, f"Exception: {str(e)}"))
+                    with self.lock:
+                        self.failed += 1
+                    
+                    if self.verbose:
+                        print(f"❌ {Path(filename).name}: {str(e)}")
+                
+                # Progress
+                if self.verbose:
+                    self._print_progress()
+        
+        elapsed = time.time() - self.start_time
+        
+        if self.verbose:
+            self._print_summary("Ligand", len(successful), len(failed), converted, elapsed)
+        
+        return {
+            'successful': successful,
+            'failed': failed,
+            'stats': {
+                'completed': self.completed,
+                'failed': self.failed,
+                'converted': converted,
+                'elapsed_time': elapsed
+            }
+        }
+    
+    def _reset_counters(self):
+        """Reset internal counters"""
+        self.completed = 0
+        self.total = 0
+        self.failed = 0
+        self.start_time = 0
+    
+    def _print_progress(self):
+        """Print progress bar"""
+        if self.total == 0:
+            return
+        
+        pct = (self.completed / self.total) * 100
+        elapsed = time.time() - self.start_time
+        
+        print(f"📊 Progress: {self.completed}/{self.total} ({pct:.0f}%) | "
+              f"✅ {self.completed - self.failed} | ❌ {self.failed} | "
+              f"⏱️ {elapsed:.1f}s")
+    
+    def _print_summary(self, file_type: str, successful: int, failed: int, 
+                      extra_count: int, elapsed: float):
+        """Print processing summary"""
+        print(f"\n{'='*60}")
+        print(f"📋 {file_type} Processing Summary")
+        print(f"{'='*60}")
+        print(f"✅ Successful: {successful}")
+        print(f"❌ Failed: {failed}")
+        
+        if file_type == "Receptor" and extra_count > 0:
+            print(f"🔧 Flexible receptors: {extra_count}")
+        elif file_type == "Ligand" and extra_count > 0:
+            print(f"🔄 Format conversions: {extra_count}")
+        
+        print(f"⏱️  Total time: {elapsed:.1f}s")
+        
+        if successful > 0:
+            avg_time = elapsed / successful
+            print(f"⚡ Average: {avg_time:.1f}s per file")
+        
+        print(f"{'='*60}\n")
 
-def show_summary(successful, failed, file_type):
-    total_time = time.time() - progress.start_time
-    print(f"\n{'='*60}")
-    print(f"📋 {file_type} Processing Summary")
-    print(f"{'='*60}")
-    print(f"✅ Successfully processed: {len(successful)}")
-    print(f"❌ Failed: {len(failed)}")
-    if hasattr(progress, 'converted') and progress.converted > 0:
-        print(f"🔄 Format conversions: {progress.converted}")
-    print(f"⏱️ Total time: {total_time:.1f}s")
-    if failed:
-        print("\n⚠️ Failed files:")
-        for i, (filename, error) in enumerate(failed[:5], 1):
-            print(f"   {i}. {filename}: {error}")
-        if len(failed) > 5:
-            print(f"   ... and {len(failed) - 5} more")
 
-
-def create_package(file_type, output_dir):
-    try:
-        archive_name = f"zymevo_{file_type}"
-        shutil.make_archive(archive_name, 'zip', output_dir)
-        zip_file = f"{archive_name}.zip"
-        if os.path.exists(zip_file):
-            return zip_file
-    except Exception as e:
-        print(f"❌ Packaging failed: {e}")
-    return None
-
+# ==================== Command-line Interface ====================
 
 def main():
-    display(HTML("""
-    <div style="text-align:center; padding:15px; background-color:#f0f7ff; border-radius:8px;">
-        <h2 style="color:#1a5fb4;">🧬 ZymEvo Unified Preprocessing</h2>
-        <p>Batch processing for receptors and ligands</p>
-    </div>
-    """))
-    print("\n📋 Select processing type:")
-    print("1️⃣  Receptor preprocessing (PDB → PDBQT)")
-    print("2️⃣  Ligand preprocessing (SDF/MOL/MOL2/PDB → PDBQT)")
-    print("3️⃣  Both (receptors + ligands)")
-    choice = input("\nEnter choice (1/2/3): ").strip()
-    openbabel_ready = False
-    if choice in ['2', '3']:
-        openbabel_ready = setup_openbabel()
-        if not openbabel_ready:
-            print_status("⚠️ OpenBabel not available. Only PDB ligands can be processed.", "warning")
-    all_successful, all_failed = [], []
-    if choice in ['1', '3']:
-        print("\n🧪 Upload receptor files (.pdb)...")
-        receptor_files = files.upload()
-        if receptor_files:
-            progress.reset()
-            successful, failed = batch_process_receptors(receptor_files, 'processed_receptors')
-            show_summary(successful, failed, "Receptor")
-            all_successful.extend(successful)
-            all_failed.extend(failed)
-            if successful:
-                pkg = create_package("receptors", "processed_receptors")
-                if pkg:
-                    files.download(pkg)
-                    print_status(f"✓ Downloaded: {pkg}", "success")
-    if choice in ['2', '3']:
-        print("\n💊 Upload ligand files...")
-        ligand_files = files.upload()
-        if ligand_files:
-            progress.reset()
-            successful, failed = batch_process_ligands(ligand_files, 'processed_ligands')
-            show_summary(successful, failed, "Ligand")
-            all_successful.extend(successful)
-            all_failed.extend(failed)
-            if successful:
-                pkg = create_package("ligands", "processed_ligands")
-                if pkg:
-                    files.download(pkg)
-                    print_status(f"✓ Downloaded: {pkg}", "success")
-    if all_successful:
-        display(HTML(f"""
-        <div style="text-align:center; padding:15px; background-color:#e8f5e9;
-                    border-radius:8px; border:1px solid #4CAF50; margin-top:20px;">
-            <h3 style="color:#2E7D32;">🎉 Processing Complete!</h3>
-            <p><strong>{len(all_successful)}</strong> files processed successfully</p>
-        </div>
-        """))
-    else:
-        display(HTML("""
-        <div style="text-align:center; padding:15px; background-color:#ffebee;
-                    border-radius:8px; border:1px solid #F44336; margin-top:20px;">
-            <h3 style="color:#C62828;">⚠️ No files processed successfully</h3>
-        </div>
-        """))
+    """Command-line interface for standalone testing"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='ZymEvo PDBQT Preprocessing Core',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Rigid receptors
+  python autopre_dock.py --receptor protein1.pdb protein2.pdb --mode rigid
+  
+  # Flexible receptors
+  python autopre_dock.py --receptor protein.pdb --mode flexible --flex-res 235:102:157
+  
+  # Ligands
+  python autopre_dock.py --ligand ligand1.sdf ligand2.mol2
+  
+  # Both
+  python autopre_dock.py --receptor protein.pdb --ligand ligand.sdf --mode rigid
+        """
+    )
+    
+    parser.add_argument('--receptor', nargs='+', help='Receptor PDB files')
+    parser.add_argument('--ligand', nargs='+', help='Ligand files (PDB/SDF/MOL/MOL2)')
+    parser.add_argument('--mode', choices=['rigid', 'flexible'], default='rigid',
+                       help='Receptor processing mode (default: rigid)')
+    parser.add_argument('--flex-res', help='Flexible residues (e.g., 235:102:157)')
+    parser.add_argument('--output', default='processed', help='Output directory')
+    parser.add_argument('--workers', type=int, default=Config.DEFAULT_WORKERS,
+                       help=f'Number of parallel workers (default: {Config.DEFAULT_WORKERS})')
+    parser.add_argument('--quiet', action='store_true', help='Suppress verbose output')
+    parser.add_argument('--verify', action='store_true', help='Verify installation only')
+    
+    args = parser.parse_args()
+    
+    # Verify installation
+    if args.verify:
+        print("Verifying installation...")
+        mgl_ok, mgl_msg = Config.verify_mgltools()
+        print(f"MGLTools: {mgl_msg}")
         
-progress = ProcessingProgress()
+        obabel_ok = Config.verify_openbabel()
+        print(f"OpenBabel: {'OK' if obabel_ok else 'Not installed (optional for ligand conversion)'}")
+        
+        sys.exit(0 if mgl_ok else 1)
+    
+    if not args.receptor and not args.ligand:
+        parser.print_help()
+        print("\n❌ Error: Provide --receptor and/or --ligand files")
+        sys.exit(1)
+    
+    if args.mode == 'flexible' and not args.flex_res:
+        print("❌ Error: --flex-res required for flexible mode")
+        sys.exit(1)
+    
+    processor = BatchProcessor(n_workers=args.workers, verbose=not args.quiet)
+    
+    if args.receptor:
+        results = processor.process_receptors(
+            args.receptor,
+            args.output,
+            mode=args.mode,
+            flexible_residues=args.flex_res
+        )
+        
+        if results['stats']['failed'] > 0 and not args.quiet:
+            print("\n⚠️  Failed files:")
+            for filename, error in results['failed'][:5]:
+                print(f"   • {Path(filename).name}: {error}")
+            if len(results['failed']) > 5:
+                print(f"   ... and {len(results['failed']) - 5} more")
+    
+    if args.ligand:
+        results = processor.process_ligands(args.ligand, args.output)
+        
+        if results['stats']['failed'] > 0 and not args.quiet:
+            print("\n⚠️  Failed files:")
+            for filename, error in results['failed'][:5]:
+                print(f"   • {Path(filename).name}: {error}")
+            if len(results['failed']) > 5:
+                print(f"   ... and {len(results['failed']) - 5} more")
+
 
 if __name__ == "__main__":
     main()
