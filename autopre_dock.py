@@ -270,42 +270,38 @@ class ReceptorProcessor:
 
     def process(self, receptor_file: str, output_dir: str) -> Tuple[List[str], Optional[str]]:
 
-    chain_fixed = PDBTools.fix_missing_chain_id(receptor_file)
-    if chain_fixed and self.verbose:
-        print(f"   🔧 Chain ID fixed → A ({Path(receptor_file).name})")
+        chain_fixed = PDBTools.fix_missing_chain_id(receptor_file)
+        if chain_fixed and self.verbose:
+            print(f"   🔧 Chain ID fixed → A ({Path(receptor_file).name})")
 
-    if not os.path.exists(receptor_file):
-        return None, f"File not found: {receptor_file}"
 
-    filename = Path(receptor_file).stem
-    os.makedirs(output_dir, exist_ok=True)
+        if not os.path.exists(receptor_file):
+            return None, f"File not found: {receptor_file}"
 
-    if self.verbose:
-        print(f"\n🔬 Processing receptor: {filename}")
-        print(f"   Mode: {self.mode}")
-        if self.mode == 'flexible':
-            print(f"   Flexible: {self.flexible_residues}")
+        filename = Path(receptor_file).stem
+        os.makedirs(output_dir, exist_ok=True)
 
-    # Step 1: prepare_receptor4
-    temp_pdbqt = os.path.join(output_dir, f"{filename}_temp.pdbqt")
+        if self.verbose:
+            print(f"\n🔬 Processing receptor: {filename}")
+            print(f"   Mode: {self.mode}")
+            if self.mode == 'flexible':
+                print(f"   Flexible: {self.flexible_residues}")
 
-    ok, err = self._run_prepare_receptor(receptor_file, temp_pdbqt)
-    if not ok:
-        return None, err
+        temp_pdbqt = os.path.join(output_dir, f"{filename}_temp.pdbqt")
+        ok, err = self._run_prepare_receptor(receptor_file, temp_pdbqt)
+        if not ok:
+            return None, err
 
-    # Step 2: validate
-    ok, msg = PDBQTValidator.validate_and_fix(temp_pdbqt)
-    if not ok:
-        return None, msg
+        ok, msg = PDBQTValidator.validate_and_fix(temp_pdbqt)
+        if not ok:
+            return None, msg
 
-    # Step 3: rigid vs flexible
-    if self.mode == 'rigid':
-        final = os.path.join(output_dir, f"{filename}.pdbqt")
-        os.rename(temp_pdbqt, final)
-        return [final], None
+        if self.mode == 'rigid':
+            final = os.path.join(output_dir, f"{filename}.pdbqt")
+            os.rename(temp_pdbqt, final)
+            return [final], None
 
-    # Flexible mode
-    return self._make_flexible(temp_pdbqt, filename, output_dir)
+        return self._make_flexible(temp_pdbqt, filename, output_dir)
     
     def _run_prepare_receptor(self, receptor_file: str, output_pdbqt: str) -> Tuple[bool, Optional[str]]:
         cmd = [
@@ -350,7 +346,6 @@ class ReceptorProcessor:
         rigid_pdbqt = os.path.join(output_dir, f"{filename}_rigid.pdbqt")
         flex_pdbqt = os.path.join(output_dir, f"{filename}_flex.pdbqt")
         
-        # Rename temp to rigid first
         os.rename(base_pdbqt, rigid_pdbqt)
         
         cmd = [
@@ -413,16 +408,7 @@ class LigandProcessor:
         Config.setup_environment()
     
     def process(self, ligand_file: str, output_dir: str) -> Tuple[Optional[str], Optional[str]]:
-        """
-        Process single ligand file
         
-        Args:
-            ligand_file: Input file (PDB, SDF, MOL, MOL2, etc.)
-            output_dir: Output directory
-        
-        Returns:
-            (output_pdbqt, error_message)
-        """
         if not os.path.exists(ligand_file):
             return None, f"File not found: {ligand_file}"
         
@@ -505,7 +491,6 @@ class LigandProcessor:
             return None, f"Conversion error: {str(e)}"
     
     def _fix_pdb_format(self, pdb_file: str):
-        """Fix common PDB formatting issues"""
         try:
             with open(pdb_file, 'r') as f:
                 lines = f.readlines()
@@ -752,7 +737,6 @@ class BatchProcessor:
                     if self.verbose:
                         print(f"❌ {Path(filename).name}: {str(e)}")
                 
-                # Progress
                 if self.verbose:
                     self._print_progress()
         
@@ -773,14 +757,14 @@ class BatchProcessor:
         }
     
     def _reset_counters(self):
-        """Reset internal counters"""
+
         self.completed = 0
         self.total = 0
         self.failed = 0
         self.start_time = 0
     
     def _print_progress(self):
-        """Print progress bar"""
+
         if self.total == 0:
             return
         
@@ -793,7 +777,7 @@ class BatchProcessor:
     
     def _print_summary(self, file_type: str, successful: int, failed: int, 
                       extra_count: int, elapsed: float):
-        """Print processing summary"""
+
         print(f"\n{'='*60}")
         print(f"📋 {file_type} Processing Summary")
         print(f"{'='*60}")
