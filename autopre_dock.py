@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""
+ZymEvo AutoPre-Dock - FIXED VERSION
+Correct parameters for prepare_flexreceptor4.py: -g (not -o)
+"""
 
 import os
 import sys
@@ -14,13 +18,7 @@ class PDBTools:
 
     @staticmethod
     def fix_missing_chain_id(pdb_file: str, chain_id: str = "A") -> bool:
-        """
-        Automatically fix missing chain ID in PDB ATOM/HETATM lines.
-        Returns:
-            True  = chain ID was modified
-            False = no modification needed
-        """
-
+        """Automatically fix missing chain ID in PDB ATOM/HETATM lines."""
         try:
             with open(pdb_file, "r") as f:
                 lines = f.readlines()
@@ -30,15 +28,11 @@ class PDBTools:
 
             for line in lines:
                 if line.startswith(("ATOM", "HETATM")):
-                    # Chain ID column is position 22 (index 21)
                     if len(line) >= 22:
                         chain_char = line[21]
-
-                        # Missing chain ID → fix
                         if chain_char in (" ", "_"):
                             line = line[:21] + chain_id + line[22:]
                             changed = True
-
                 fixed.append(line)
 
             if changed:
@@ -54,7 +48,6 @@ class PDBTools:
 class Config:
     """Global configuration for MGLTools paths and environment"""
     
-    # MGLTools paths (adjust if needed)
     MGLTOOLS_PATH = "/usr/local/autodocktools/bin/pythonsh"
     PREPARE_RECEPTOR = "/usr/local/autodocktools/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_receptor4.py"
     PREPARE_LIGAND = "/usr/local/autodocktools/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_ligand4.py"
@@ -63,27 +56,22 @@ class Config:
     PYTHONPATH = "/usr/local/autodocktools/MGLToolsPckgs"
     
     DEFAULT_WORKERS = 4
-    TIMEOUT_SECONDS = 300  # 5 minutes per file
+    TIMEOUT_SECONDS = 300
     
     @classmethod
     def setup_environment(cls):
-        """Setup required environment variables"""
         os.environ['PYTHONPATH'] = cls.PYTHONPATH
     
     @classmethod
     def verify_mgltools(cls) -> Tuple[bool, str]:
-        """Verify MGLTools installation"""
         if not os.path.exists(cls.MGLTOOLS_PATH):
             return False, f"MGLTools not found at {cls.MGLTOOLS_PATH}"
-        
         if not os.path.exists(cls.PREPARE_RECEPTOR):
             return False, f"prepare_receptor4.py not found"
-        
         return True, "MGLTools OK"
     
     @classmethod
     def verify_openbabel(cls) -> bool:
-        """Check if OpenBabel is available"""
         try:
             result = subprocess.run(['obabel', '-V'], 
                                   capture_output=True, 
@@ -97,14 +85,7 @@ class PDBQTValidator:
     @staticmethod
     def validate_and_fix(pdbqt_file: str, verbose: bool = True, 
                         is_flexible_part: bool = False) -> Tuple[bool, str]:
-        """
-        Validate and fix PDBQT files.
-        
-        Args:
-            pdbqt_file: Path to PDBQT file
-            verbose: Print detailed messages
-            is_flexible_part: True if this is a flexible residue file (_flex.pdbqt)
-        """
+        """Validate and fix PDBQT files."""
         if not os.path.exists(pdbqt_file):
             return False, "File not found"
         
@@ -123,12 +104,10 @@ class PDBQTValidator:
                     has_atoms = True
                     n_atoms += 1
                     
-                    # Check carbon atom type
                     if len(line) >= 79:
                         atom_name = line[12:16].strip()
                         atom_type = line[77:79].strip()
                         
-                        # Carbon should be type "A" not "C"
                         if atom_name.startswith('C') and atom_type == "C":
                             carbon_issues.append(i)
                 
@@ -145,7 +124,6 @@ class PDBQTValidator:
             needs_fix = False
             messages = []
             
-            # Fix carbon atom types
             if carbon_issues:
                 for i in carbon_issues:
                     lines[i] = lines[i][:77] + " A" + (lines[i][79:] if len(lines[i]) > 79 else "\n")
@@ -154,9 +132,7 @@ class PDBQTValidator:
                 if verbose:
                     print(f"  🔧 Fixed {len(carbon_issues)} carbon atoms")
             
-            # Handle missing TORSDOF
             if not has_torsdof:
-                # For flexible parts, count rotatable bonds
                 if is_flexible_part:
                     torsdof = PDBQTValidator._count_rotatable_bonds(lines)
                     lines.append(f"TORSDOF {torsdof}\n")
@@ -165,16 +141,13 @@ class PDBQTValidator:
                     if verbose:
                         print(f"  ➕ Added TORSDOF {torsdof} (flexible residues)")
                 
-                # For other files, use heuristic
                 elif n_atoms > 100:
-                    # Likely rigid receptor -> TORSDOF 0
                     lines.append("TORSDOF 0\n")
                     torsdof_value = 0
                     messages.append("Added TORSDOF 0 (rigid)")
                     if verbose:
                         print(f"  ➕ Added TORSDOF 0 (rigid receptor)")
                 else:
-                    # Likely ligand -> count rotatable bonds
                     torsdof = PDBQTValidator._count_rotatable_bonds(lines)
                     lines.append(f"TORSDOF {torsdof}\n")
                     torsdof_value = torsdof
@@ -188,7 +161,6 @@ class PDBQTValidator:
                 with open(pdbqt_file, 'w') as f:
                     f.writelines(lines)
             
-            # Summary message
             if messages:
                 message = "; ".join(messages)
             else:
@@ -201,23 +173,14 @@ class PDBQTValidator:
     
     @staticmethod
     def _count_rotatable_bonds(lines: List[str]) -> int:
-        """Count rotatable bonds from BRANCH records"""
         branch_count = 0
-        
         for line in lines:
             if line.startswith('BRANCH'):
                 branch_count += 1
-        
-        # BRANCH count is usually accurate
-        if branch_count > 0:
-            return branch_count
-        
-        # Fallback: conservative estimate
-        return 0
+        return branch_count if branch_count > 0 else 0
     
     @staticmethod
     def quick_check(pdbqt_file: str) -> Dict[str, Union[bool, int]]:
-        """Quick check of PDBQT file status"""
         result = {
             'has_atoms': False,
             'has_torsdof': False,
@@ -260,33 +223,16 @@ class ReceptorProcessor:
     
     def __init__(self, mode: str = 'rigid', flexible_residues: Optional[str] = None, 
                  verbose: bool = True):
-        """
-        Initialize receptor processor.
-        
-        Args:
-            mode: 'rigid' or 'flexible'
-            flexible_residues: Residue IDs for flexible docking (e.g., "235:102:157")
-            verbose: Enable detailed output
-        """
         self.mode = mode
         self.flexible_residues = flexible_residues
         self.verbose = verbose
         
-        # Validate configuration
         if mode == 'flexible' and not flexible_residues:
             raise ValueError("flexible_residues required for flexible mode")
         
         Config.setup_environment()
     
     def process(self, pdb_file: str, output_dir: str) -> Tuple[Optional[List[str]], Optional[str]]:
-        """
-        Process a receptor PDB file.
-        
-        Returns:
-            ([output_files], error_message)
-            - For rigid: [receptor.pdbqt]
-            - For flexible: [receptor_rigid.pdbqt, receptor_flex.pdbqt]
-        """
         if not os.path.exists(pdb_file):
             return None, f"File not found: {pdb_file}"
         
@@ -300,25 +246,21 @@ class ReceptorProcessor:
             else:
                 print(f"   🔒 Mode: Rigid")
         
-        # Step 1: Fix missing chain IDs
         chain_fixed = PDBTools.fix_missing_chain_id(pdb_file)
         if chain_fixed and self.verbose:
             print(f"   ✅ Fixed missing chain ID")
         
-        # Step 2: Generate base PDBQT with prepare_receptor4.py
         base_pdbqt = os.path.join(output_dir, f"{filename}.pdbqt")
         
         success, error = self._run_prepare_receptor(pdb_file, base_pdbqt)
         if not success:
             return None, error
         
-        # Step 3: Mode-specific processing
         if self.mode == 'flexible':
             output_files, warning = self._make_flexible(base_pdbqt, filename, output_dir)
             return output_files, warning
         
         else:
-            # Rigid mode: validate base PDBQT
             success, msg = PDBQTValidator.validate_and_fix(base_pdbqt, 
                                                           verbose=self.verbose,
                                                           is_flexible_part=False)
@@ -334,7 +276,6 @@ class ReceptorProcessor:
     
     def _run_prepare_receptor(self, pdb_file: str, 
                              output_pdbqt: str) -> Tuple[bool, Optional[str]]:
-        """Run prepare_receptor4.py"""
         cmd = [
             Config.MGLTOOLS_PATH,
             Config.PREPARE_RECEPTOR,
@@ -374,24 +315,21 @@ class ReceptorProcessor:
     def _make_flexible(self, base_pdbqt: str, filename: str, 
                       output_dir: str) -> Tuple[List[str], Optional[str]]:
         """
-        Create flexible receptor using prepare_flexreceptor4.py.
-        
-        Returns:
-            ([rigid.pdbqt, flex.pdbqt], warning_message)
+        FIXED: Use -g parameter instead of -o for prepare_flexreceptor4.py
         """
         rigid_pdbqt = os.path.join(output_dir, f"{filename}_rigid.pdbqt")
         flex_pdbqt = os.path.join(output_dir, f"{filename}_flex.pdbqt")
         
-        # Rename base PDBQT to rigid
         os.rename(base_pdbqt, rigid_pdbqt)
         
+        # CRITICAL FIX: Use -g instead of -o
         cmd = [
             Config.MGLTOOLS_PATH,
             Config.PREPARE_FLEXRECEPTOR,
             "-r", rigid_pdbqt,
             "-s", self.flexible_residues,
-            "-o", rigid_pdbqt,  # Updated rigid part (overwrites)
-            "-x", flex_pdbqt    # Flexible part
+            "-g", rigid_pdbqt,  # FIXED: -g not -o!
+            "-x", flex_pdbqt
         ]
         
         try:
@@ -404,19 +342,15 @@ class ReceptorProcessor:
             )
             
             if result.returncode == 0 and os.path.exists(flex_pdbqt):
-                # Success - validate both files
-                # Rigid part should have TORSDOF 0 (this is correct!)
                 PDBQTValidator.validate_and_fix(rigid_pdbqt, 
                                                verbose=False, 
                                                is_flexible_part=False)
                 
-                # Flexible part should have TORSDOF > 0
                 PDBQTValidator.validate_and_fix(flex_pdbqt, 
                                                verbose=False, 
                                                is_flexible_part=True)
                 
                 if self.verbose:
-                    # Check TORSDOF values for reporting
                     rigid_info = PDBQTValidator.quick_check(rigid_pdbqt)
                     flex_info = PDBQTValidator.quick_check(flex_pdbqt)
                     
@@ -428,7 +362,6 @@ class ReceptorProcessor:
                 return [rigid_pdbqt, flex_pdbqt], None
             
             else:
-                # Flexible generation failed - keep rigid only
                 error = result.stderr.strip()[:200] if result.stderr else "Unknown error"
                 warning = f"Flexible generation failed: {error}"
                 
@@ -457,7 +390,6 @@ class LigandProcessor:
         Config.setup_environment()
     
     def process(self, ligand_file: str, output_dir: str) -> Tuple[Optional[str], Optional[str]]:
-        """Process a ligand file to PDBQT format"""
         if not os.path.exists(ligand_file):
             return None, f"File not found: {ligand_file}"
         
@@ -468,7 +400,6 @@ class LigandProcessor:
         if self.verbose:
             print(f"\n💊 Processing ligand: {filename}{file_ext}")
         
-        # Step 1: Format conversion if needed
         if file_ext != '.pdb':
             pdb_file, error = self._convert_to_pdb(ligand_file, output_dir, filename)
             if not pdb_file:
@@ -481,14 +412,12 @@ class LigandProcessor:
             if self.verbose:
                 print(f"   ✅ PDB format (no conversion needed)")
         
-        # Step 2: Generate PDBQT with prepare_ligand4.py
         output_pdbqt = os.path.join(output_dir, f"{filename}.pdbqt")
         
         success, error = self._run_prepare_ligand(work_file, output_pdbqt)
         if not success:
             return None, error
         
-        # Step 3: Validate and fix TORSDOF
         success, msg = PDBQTValidator.validate_and_fix(output_pdbqt, 
                                                        verbose=self.verbose,
                                                        is_flexible_part=False)
@@ -504,7 +433,6 @@ class LigandProcessor:
     
     def _convert_to_pdb(self, input_file: str, output_dir: str, 
                        filename: str) -> Tuple[Optional[str], Optional[str]]:
-        """Convert non-PDB formats to PDB using OpenBabel"""
         pdb_file = os.path.join(output_dir, f"{filename}_converted.pdb")
         
         cmd = ['obabel', input_file, '-O', pdb_file, '--gen3d']
@@ -527,7 +455,6 @@ class LigandProcessor:
             if os.path.getsize(pdb_file) < 50:
                 return None, "PDB file too small (corrupt?)"
             
-            # Fix PDB formatting issues
             self._fix_pdb_format(pdb_file)
             
             return pdb_file, None
@@ -542,7 +469,6 @@ class LigandProcessor:
             return None, f"Conversion error: {str(e)}"
     
     def _fix_pdb_format(self, pdb_file: str):
-        """Fix common PDB formatting issues"""
         try:
             with open(pdb_file, 'r') as f:
                 lines = f.readlines()
@@ -552,34 +478,29 @@ class LigandProcessor:
             has_ter = False
             
             for line in lines:
-                # Convert HETATM to ATOM
                 if line.startswith('HETATM'):
                     line = 'ATOM  ' + line[6:]
                     atom_count += 1
                 elif line.startswith('ATOM'):
                     atom_count += 1
                 
-                # Skip problematic records
                 if line.startswith(('CONECT', 'MASTER', 'SSBOND', 'LINK', 'CISPEP')):
                     continue
                 
-                # Add TER before END if missing
                 if line.startswith('END') and not has_ter:
                     fixed_lines.append(f"TER   {atom_count+1:5d}      UNL A   1\n")
                     has_ter = True
                 
                 fixed_lines.append(line)
             
-            # Write back
             with open(pdb_file, 'w') as f:
                 f.writelines(fixed_lines)
         
         except:
-            pass  # Non-critical, continue even if fix fails
+            pass
     
     def _run_prepare_ligand(self, ligand_file: str, 
                            output_pdbqt: str) -> Tuple[bool, Optional[str]]:
-        """Run prepare_ligand4.py"""
         cmd = [
             Config.MGLTOOLS_PATH,
             Config.PREPARE_LIGAND,
@@ -617,7 +538,6 @@ class LigandProcessor:
             return False, f"Exception: {str(e)}"
 
 class BatchProcessor:
-    """Parallel batch processing of receptors and ligands"""
     
     def __init__(self, n_workers: int = Config.DEFAULT_WORKERS, verbose: bool = True):
         self.n_workers = n_workers
@@ -633,16 +553,7 @@ class BatchProcessor:
                          output_dir: str,
                          mode: str = 'rigid',
                          flexible_residues: Optional[str] = None) -> Dict:
-        """
-        Process multiple receptors in parallel.
         
-        Returns:
-            {
-                'successful': [list of output files],
-                'failed': [(filename, error), ...],
-                'stats': {...}
-            }
-        """
         self._reset_counters()
         self.total = len(receptor_files)
         self.start_time = time.time()
@@ -684,7 +595,6 @@ class BatchProcessor:
                     if output_files:
                         successful.extend(output_files)
                         
-                        # Count flexible receptors
                         if len(output_files) == 2:
                             flexible_count += 1
                         
@@ -732,7 +642,7 @@ class BatchProcessor:
     def process_ligands(self,
                        ligand_files: List[str],
                        output_dir: str) -> Dict:
-        """Process multiple ligands in parallel"""
+        
         self._reset_counters()
         self.total = len(ligand_files)
         self.start_time = time.time()
@@ -769,7 +679,6 @@ class BatchProcessor:
                     if output_file:
                         successful.append(output_file)
                         
-                        # Check if conversion happened
                         if Path(filename).suffix.lower() != '.pdb':
                             converted += 1
                         
@@ -811,14 +720,12 @@ class BatchProcessor:
         }
     
     def _reset_counters(self):
-        """Reset internal counters"""
         self.completed = 0
         self.total = 0
         self.failed = 0
         self.start_time = 0
     
     def _print_progress(self):
-        """Print progress bar"""
         if self.total == 0:
             return
         
@@ -831,7 +738,6 @@ class BatchProcessor:
     
     def _print_summary(self, file_type: str, successful: int, failed: int, 
                       extra_count: int, elapsed: float):
-        """Print processing summary"""
         print(f"\n{'='*60}")
         print(f"📋 {file_type} Processing Summary")
         print(f"{'='*60}")
@@ -852,28 +758,22 @@ class BatchProcessor:
         print(f"{'='*60}\n")
 
 
-# ==================== Command-line Interface ====================
-
 def main():
-    """Command-line interface for standalone testing"""
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='ZymEvo PDBQT Preprocessing Core (Fixed Version)',
+        description='ZymEvo PDBQT Preprocessing - FIXED VERSION (use -g not -o)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Rigid receptors
-  python autopre_dock_fixed.py --receptor protein1.pdb protein2.pdb --mode rigid
+  python autopre_dock.py --receptor protein1.pdb protein2.pdb --mode rigid
   
-  # Flexible receptors
-  python autopre_dock_fixed.py --receptor protein.pdb --mode flexible --flex-res 235:102:157
+  # Flexible receptors (use RESNAME+NUMBER format)
+  python autopre_dock.py --receptor protein.pdb --mode flexible --flex-res "ASP231_HIS235_GLU261"
   
   # Ligands
-  python autopre_dock_fixed.py --ligand ligand1.sdf ligand2.mol2
-  
-  # Both
-  python autopre_dock_fixed.py --receptor protein.pdb --ligand ligand.sdf --mode rigid
+  python autopre_dock.py --ligand ligand1.sdf ligand2.mol2
         """
     )
     
@@ -881,7 +781,7 @@ Examples:
     parser.add_argument('--ligand', nargs='+', help='Ligand files (PDB/SDF/MOL/MOL2)')
     parser.add_argument('--mode', choices=['rigid', 'flexible'], default='rigid',
                        help='Receptor processing mode (default: rigid)')
-    parser.add_argument('--flex-res', help='Flexible residues (e.g., 235:102:157)')
+    parser.add_argument('--flex-res', help='Flexible residues (e.g., ASP231_HIS235_GLU261)')
     parser.add_argument('--output', default='processed', help='Output directory')
     parser.add_argument('--workers', type=int, default=Config.DEFAULT_WORKERS,
                        help=f'Number of parallel workers (default: {Config.DEFAULT_WORKERS})')
@@ -890,7 +790,6 @@ Examples:
     
     args = parser.parse_args()
     
-    # Verify installation
     if args.verify:
         print("Verifying installation...")
         mgl_ok, mgl_msg = Config.verify_mgltools()
