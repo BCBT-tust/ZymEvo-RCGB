@@ -95,7 +95,16 @@ class Config:
 class PDBQTValidator:
     
     @staticmethod
-    def validate_and_fix(pdbqt_file: str, verbose: bool = True) -> Tuple[bool, str]:
+    def validate_and_fix(pdbqt_file: str, verbose: bool = True, 
+                        is_flexible_part: bool = False) -> Tuple[bool, str]:
+        """
+        Validate and fix PDBQT files.
+        
+        Args:
+            pdbqt_file: Path to PDBQT file
+            verbose: Print detailed messages
+            is_flexible_part: True if this is a flexible residue file (_flex.pdbqt)
+        """
         if not os.path.exists(pdbqt_file):
             return False, "File not found"
         
@@ -136,6 +145,7 @@ class PDBQTValidator:
             needs_fix = False
             messages = []
             
+            # Fix carbon atom types
             if carbon_issues:
                 for i in carbon_issues:
                     lines[i] = lines[i][:77] + " A" + (lines[i][79:] if len(lines[i]) > 79 else "\n")
@@ -144,15 +154,25 @@ class PDBQTValidator:
                 if verbose:
                     print(f"  🔧 Fixed {len(carbon_issues)} carbon atoms")
             
+            # Handle missing TORSDOF
             if not has_torsdof:
-                # Receptor vs ligand heuristic
-                if n_atoms > 100:
-                    # Likely receptor -> TORSDOF 0 (rigid)
+                # For flexible parts, count rotatable bonds
+                if is_flexible_part:
+                    torsdof = PDBQTValidator._count_rotatable_bonds(lines)
+                    lines.append(f"TORSDOF {torsdof}\n")
+                    torsdof_value = torsdof
+                    messages.append(f"Added TORSDOF {torsdof} (flexible part)")
+                    if verbose:
+                        print(f"  ➕ Added TORSDOF {torsdof} (flexible residues)")
+                
+                # For other files, use heuristic
+                elif n_atoms > 100:
+                    # Likely rigid receptor -> TORSDOF 0
                     lines.append("TORSDOF 0\n")
                     torsdof_value = 0
-                    messages.append("Added TORSDOF 0 (receptor)")
+                    messages.append("Added TORSDOF 0 (rigid)")
                     if verbose:
-                        print(f"  ➕ Added TORSDOF 0 (receptor)")
+                        print(f"  ➕ Added TORSDOF 0 (rigid receptor)")
                 else:
                     # Likely ligand -> count rotatable bonds
                     torsdof = PDBQTValidator._count_rotatable_bonds(lines)
@@ -161,6 +181,7 @@ class PDBQTValidator:
                     messages.append(f"Added TORSDOF {torsdof} (ligand)")
                     if verbose:
                         print(f"  ➕ Added TORSDOF {torsdof} (ligand)")
+                
                 needs_fix = True
 
             if needs_fix:
@@ -180,7 +201,7 @@ class PDBQTValidator:
     
     @staticmethod
     def _count_rotatable_bonds(lines: List[str]) -> int:
-
+        """Count rotatable bonds from BRANCH records"""
         branch_count = 0
         
         for line in lines:
@@ -192,12 +213,11 @@ class PDBQTValidator:
             return branch_count
         
         # Fallback: conservative estimate
-        # No BRANCH info -> assume rigid or poorly formatted
         return 0
     
     @staticmethod
     def quick_check(pdbqt_file: str) -> Dict[str, Union[bool, int]]:
-        
+        """Quick check of PDBQT file status"""
         result = {
             'has_atoms': False,
             'has_torsdof': False,
@@ -229,85 +249,96 @@ class PDBQTValidator:
                     except:
                         pass
             
-            result['is_valid'] = (result['has_atoms'] and 
-                                 result['has_torsdof'] and 
-                                 result['carbon_issues'] == 0)
+            result['is_valid'] = result['has_atoms'] and result['has_torsdof']
             
         except:
             pass
         
         return result
 
-
 class ReceptorProcessor:
-
-    def __init__(self, mode: str = 'rigid',
-                 flexible_residues: Optional[str] = None,
-                 verbose: bool = True):
-
-        self.mode = mode.lower()
-        self.verbose = verbose
-
-        # Normalize flexible residue list
-        if flexible_residues:
-            self.flexible_residues = (
-                flexible_residues.replace(",", " ")
-                                 .replace(":", " ")
-                                 .replace(";", " ")
-                                 .replace("\t", " ")
-                                 .strip()
-            )
-        else:
-            self.flexible_residues = None
-
-        if self.mode not in ['rigid', 'flexible']:
-            raise ValueError("mode must be rigid or flexible")
-
-        if self.mode == 'flexible' and not self.flexible_residues:
-            raise ValueError("flexible residues required in flexible mode")
-
-        Config.setup_environment()
-
-    def process(self, receptor_file: str, output_dir: str) -> Tuple[List[str], Optional[str]]:
-
-        chain_fixed = PDBTools.fix_missing_chain_id(receptor_file)
-        if chain_fixed and self.verbose:
-            print(f"   🔧 Chain ID fixed → A ({Path(receptor_file).name})")
-
-
-        if not os.path.exists(receptor_file):
-            return None, f"File not found: {receptor_file}"
-
-        filename = Path(receptor_file).stem
-        os.makedirs(output_dir, exist_ok=True)
-
-        if self.verbose:
-            print(f"\n🔬 Processing receptor: {filename}")
-            print(f"   Mode: {self.mode}")
-            if self.mode == 'flexible':
-                print(f"   Flexible: {self.flexible_residues}")
-
-        temp_pdbqt = os.path.join(output_dir, f"{filename}_temp.pdbqt")
-        ok, err = self._run_prepare_receptor(receptor_file, temp_pdbqt)
-        if not ok:
-            return None, err
-
-        ok, msg = PDBQTValidator.validate_and_fix(temp_pdbqt)
-        if not ok:
-            return None, msg
-
-        if self.mode == 'rigid':
-            final = os.path.join(output_dir, f"{filename}.pdbqt")
-            os.rename(temp_pdbqt, final)
-            return [final], None
-
-        return self._make_flexible(temp_pdbqt, filename, output_dir)
     
-    def _run_prepare_receptor(self, receptor_file: str, output_pdbqt: str) -> Tuple[bool, Optional[str]]:
+    def __init__(self, mode: str = 'rigid', flexible_residues: Optional[str] = None, 
+                 verbose: bool = True):
+        """
+        Initialize receptor processor.
+        
+        Args:
+            mode: 'rigid' or 'flexible'
+            flexible_residues: Residue IDs for flexible docking (e.g., "235:102:157")
+            verbose: Enable detailed output
+        """
+        self.mode = mode
+        self.flexible_residues = flexible_residues
+        self.verbose = verbose
+        
+        # Validate configuration
+        if mode == 'flexible' and not flexible_residues:
+            raise ValueError("flexible_residues required for flexible mode")
+        
+        Config.setup_environment()
+    
+    def process(self, pdb_file: str, output_dir: str) -> Tuple[Optional[List[str]], Optional[str]]:
+        """
+        Process a receptor PDB file.
+        
+        Returns:
+            ([output_files], error_message)
+            - For rigid: [receptor.pdbqt]
+            - For flexible: [receptor_rigid.pdbqt, receptor_flex.pdbqt]
+        """
+        if not os.path.exists(pdb_file):
+            return None, f"File not found: {pdb_file}"
+        
+        filename = Path(pdb_file).stem
+        os.makedirs(output_dir, exist_ok=True)
+        
+        if self.verbose:
+            print(f"\n🧬 Processing receptor: {filename}.pdb")
+            if self.mode == 'flexible':
+                print(f"   🔧 Mode: Flexible (residues: {self.flexible_residues})")
+            else:
+                print(f"   🔒 Mode: Rigid")
+        
+        # Step 1: Fix missing chain IDs
+        chain_fixed = PDBTools.fix_missing_chain_id(pdb_file)
+        if chain_fixed and self.verbose:
+            print(f"   ✅ Fixed missing chain ID")
+        
+        # Step 2: Generate base PDBQT with prepare_receptor4.py
+        base_pdbqt = os.path.join(output_dir, f"{filename}.pdbqt")
+        
+        success, error = self._run_prepare_receptor(pdb_file, base_pdbqt)
+        if not success:
+            return None, error
+        
+        # Step 3: Mode-specific processing
+        if self.mode == 'flexible':
+            output_files, warning = self._make_flexible(base_pdbqt, filename, output_dir)
+            return output_files, warning
+        
+        else:
+            # Rigid mode: validate base PDBQT
+            success, msg = PDBQTValidator.validate_and_fix(base_pdbqt, 
+                                                          verbose=self.verbose,
+                                                          is_flexible_part=False)
+            if not success:
+                return None, f"Validation failed: {msg}"
+            
+            if self.verbose:
+                if msg and msg != "OK":
+                    print(f"   {msg}")
+                print(f"   ✅ Generated: {filename}.pdbqt")
+            
+            return [base_pdbqt], None
+    
+    def _run_prepare_receptor(self, pdb_file: str, 
+                             output_pdbqt: str) -> Tuple[bool, Optional[str]]:
+        """Run prepare_receptor4.py"""
         cmd = [
             Config.MGLTOOLS_PATH,
             Config.PREPARE_RECEPTOR,
-            "-r", receptor_file,
+            "-r", pdb_file,
             "-o", output_pdbqt,
             "-A", "hydrogens",
             "-U", "nphs_lps_waters"
@@ -327,10 +358,10 @@ class ReceptorProcessor:
                 return False, f"prepare_receptor4 failed: {error[:200]}"
             
             if not os.path.exists(output_pdbqt):
-                return False, "Output PDBQT not generated"
+                return False, "PDBQT file not generated"
             
             if os.path.getsize(output_pdbqt) < 100:
-                return False, "Output PDBQT too small (corrupt?)"
+                return False, "PDBQT file too small (corrupt?)"
             
             return True, None
         
@@ -342,10 +373,16 @@ class ReceptorProcessor:
     
     def _make_flexible(self, base_pdbqt: str, filename: str, 
                       output_dir: str) -> Tuple[List[str], Optional[str]]:
-                          
+        """
+        Create flexible receptor using prepare_flexreceptor4.py.
+        
+        Returns:
+            ([rigid.pdbqt, flex.pdbqt], warning_message)
+        """
         rigid_pdbqt = os.path.join(output_dir, f"{filename}_rigid.pdbqt")
         flex_pdbqt = os.path.join(output_dir, f"{filename}_flex.pdbqt")
         
+        # Rename base PDBQT to rigid
         os.rename(base_pdbqt, rigid_pdbqt)
         
         cmd = [
@@ -353,7 +390,7 @@ class ReceptorProcessor:
             Config.PREPARE_FLEXRECEPTOR,
             "-r", rigid_pdbqt,
             "-s", self.flexible_residues,
-            "-o", rigid_pdbqt,  # Updated rigid part
+            "-o", rigid_pdbqt,  # Updated rigid part (overwrites)
             "-x", flex_pdbqt    # Flexible part
         ]
         
@@ -368,12 +405,25 @@ class ReceptorProcessor:
             
             if result.returncode == 0 and os.path.exists(flex_pdbqt):
                 # Success - validate both files
-                PDBQTValidator.validate_and_fix(rigid_pdbqt, verbose=False)
-                PDBQTValidator.validate_and_fix(flex_pdbqt, verbose=False)
+                # Rigid part should have TORSDOF 0 (this is correct!)
+                PDBQTValidator.validate_and_fix(rigid_pdbqt, 
+                                               verbose=False, 
+                                               is_flexible_part=False)
+                
+                # Flexible part should have TORSDOF > 0
+                PDBQTValidator.validate_and_fix(flex_pdbqt, 
+                                               verbose=False, 
+                                               is_flexible_part=True)
                 
                 if self.verbose:
-                    print(f"   ✅ Generated: {filename}_rigid.pdbqt")
-                    print(f"   ✅ Generated: {filename}_flex.pdbqt")
+                    # Check TORSDOF values for reporting
+                    rigid_info = PDBQTValidator.quick_check(rigid_pdbqt)
+                    flex_info = PDBQTValidator.quick_check(flex_pdbqt)
+                    
+                    print(f"   ✅ Generated: {filename}_rigid.pdbqt "
+                          f"(TORSDOF={rigid_info['torsdof_value']})")
+                    print(f"   ✅ Generated: {filename}_flex.pdbqt "
+                          f"(TORSDOF={flex_info['torsdof_value']})")
                 
                 return [rigid_pdbqt, flex_pdbqt], None
             
@@ -403,12 +453,11 @@ class ReceptorProcessor:
 class LigandProcessor:
     
     def __init__(self, verbose: bool = True):
-
         self.verbose = verbose
         Config.setup_environment()
     
     def process(self, ligand_file: str, output_dir: str) -> Tuple[Optional[str], Optional[str]]:
-        
+        """Process a ligand file to PDBQT format"""
         if not os.path.exists(ligand_file):
             return None, f"File not found: {ligand_file}"
         
@@ -440,7 +489,9 @@ class LigandProcessor:
             return None, error
         
         # Step 3: Validate and fix TORSDOF
-        success, msg = PDBQTValidator.validate_and_fix(output_pdbqt, verbose=self.verbose)
+        success, msg = PDBQTValidator.validate_and_fix(output_pdbqt, 
+                                                       verbose=self.verbose,
+                                                       is_flexible_part=False)
         if not success:
             return None, f"Validation failed: {msg}"
         
@@ -453,7 +504,7 @@ class LigandProcessor:
     
     def _convert_to_pdb(self, input_file: str, output_dir: str, 
                        filename: str) -> Tuple[Optional[str], Optional[str]]:
-
+        """Convert non-PDB formats to PDB using OpenBabel"""
         pdb_file = os.path.join(output_dir, f"{filename}_converted.pdb")
         
         cmd = ['obabel', input_file, '-O', pdb_file, '--gen3d']
@@ -491,6 +542,7 @@ class LigandProcessor:
             return None, f"Conversion error: {str(e)}"
     
     def _fix_pdb_format(self, pdb_file: str):
+        """Fix common PDB formatting issues"""
         try:
             with open(pdb_file, 'r') as f:
                 lines = f.readlines()
@@ -527,7 +579,7 @@ class LigandProcessor:
     
     def _run_prepare_ligand(self, ligand_file: str, 
                            output_pdbqt: str) -> Tuple[bool, Optional[str]]:
-
+        """Run prepare_ligand4.py"""
         cmd = [
             Config.MGLTOOLS_PATH,
             Config.PREPARE_LIGAND,
@@ -551,10 +603,10 @@ class LigandProcessor:
                 return False, f"prepare_ligand4 failed: {error[:200]}"
             
             if not os.path.exists(output_pdbqt):
-                return False, "Output PDBQT not generated"
+                return False, "PDBQT file not generated"
             
-            if os.path.getsize(output_pdbqt) < 100:
-                return False, "Output PDBQT too small (corrupt?)"
+            if os.path.getsize(output_pdbqt) < 50:
+                return False, "PDBQT file too small"
             
             return True, None
         
@@ -564,33 +616,33 @@ class LigandProcessor:
         except Exception as e:
             return False, f"Exception: {str(e)}"
 
-
 class BatchProcessor:
+    """Parallel batch processing of receptors and ligands"""
     
-    def __init__(self, n_workers: int = None, verbose: bool = True):
-        """
-        Initialize batch processor
-        
-        Args:
-            n_workers: Number of parallel workers (default: Config.DEFAULT_WORKERS)
-            verbose: Print detailed progress
-        """
-        self.n_workers = n_workers or Config.DEFAULT_WORKERS
+    def __init__(self, n_workers: int = Config.DEFAULT_WORKERS, verbose: bool = True):
+        self.n_workers = n_workers
         self.verbose = verbose
-        
-        # Thread-safe counters
         self.lock = threading.Lock()
         self.completed = 0
         self.total = 0
         self.failed = 0
         self.start_time = 0
     
-    def process_receptors(self, 
+    def process_receptors(self,
                          receptor_files: List[str],
                          output_dir: str,
                          mode: str = 'rigid',
                          flexible_residues: Optional[str] = None) -> Dict:
-
+        """
+        Process multiple receptors in parallel.
+        
+        Returns:
+            {
+                'successful': [list of output files],
+                'failed': [(filename, error), ...],
+                'stats': {...}
+            }
+        """
         self._reset_counters()
         self.total = len(receptor_files)
         self.start_time = time.time()
@@ -600,17 +652,15 @@ class BatchProcessor:
             print(f"🚀 Batch Receptor Processing")
             print(f"{'='*60}")
             print(f"Files: {self.total}")
-            print(f"Mode: {mode}")
+            print(f"Mode: {mode.upper()}")
             if mode == 'flexible':
                 print(f"Flexible residues: {flexible_residues}")
             print(f"Workers: {self.n_workers}")
             print(f"{'='*60}\n")
         
-        processor = ReceptorProcessor(
-            mode=mode,
-            flexible_residues=flexible_residues,
-            verbose=False  # Individual verbose handled in callback
-        )
+        processor = ReceptorProcessor(mode=mode, 
+                                     flexible_residues=flexible_residues,
+                                     verbose=False)
         
         successful = []
         failed = []
@@ -634,11 +684,16 @@ class BatchProcessor:
                     if output_files:
                         successful.extend(output_files)
                         
-                        if len(output_files) > 1:
+                        # Count flexible receptors
+                        if len(output_files) == 2:
                             flexible_count += 1
                         
                         if self.verbose:
-                            print(f"✅ {Path(filename).name}: {len(output_files)} file(s)")
+                            if len(output_files) == 2:
+                                print(f"✅ {Path(filename).name} → "
+                                     f"{Path(output_files[0]).name}, {Path(output_files[1]).name}")
+                            else:
+                                print(f"✅ {Path(filename).name} → {Path(output_files[0]).name}")
                     else:
                         failed.append((filename, error))
                         with self.lock:
@@ -653,9 +708,8 @@ class BatchProcessor:
                         self.failed += 1
                     
                     if self.verbose:
-                        print(f"❌ {Path(filename).name}: Exception - {str(e)}")
+                        print(f"❌ {Path(filename).name}: {str(e)}")
                 
-                # Progress
                 if self.verbose:
                     self._print_progress()
         
@@ -678,7 +732,7 @@ class BatchProcessor:
     def process_ligands(self,
                        ligand_files: List[str],
                        output_dir: str) -> Dict:
-                           
+        """Process multiple ligands in parallel"""
         self._reset_counters()
         self.total = len(ligand_files)
         self.start_time = time.time()
@@ -757,14 +811,14 @@ class BatchProcessor:
         }
     
     def _reset_counters(self):
-
+        """Reset internal counters"""
         self.completed = 0
         self.total = 0
         self.failed = 0
         self.start_time = 0
     
     def _print_progress(self):
-
+        """Print progress bar"""
         if self.total == 0:
             return
         
@@ -777,7 +831,7 @@ class BatchProcessor:
     
     def _print_summary(self, file_type: str, successful: int, failed: int, 
                       extra_count: int, elapsed: float):
-
+        """Print processing summary"""
         print(f"\n{'='*60}")
         print(f"📋 {file_type} Processing Summary")
         print(f"{'='*60}")
@@ -805,21 +859,21 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='ZymEvo PDBQT Preprocessing Core',
+        description='ZymEvo PDBQT Preprocessing Core (Fixed Version)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Rigid receptors
-  python autopre_dock.py --receptor protein1.pdb protein2.pdb --mode rigid
+  python autopre_dock_fixed.py --receptor protein1.pdb protein2.pdb --mode rigid
   
   # Flexible receptors
-  python autopre_dock.py --receptor protein.pdb --mode flexible --flex-res 235:102:157
+  python autopre_dock_fixed.py --receptor protein.pdb --mode flexible --flex-res 235:102:157
   
   # Ligands
-  python autopre_dock.py --ligand ligand1.sdf ligand2.mol2
+  python autopre_dock_fixed.py --ligand ligand1.sdf ligand2.mol2
   
   # Both
-  python autopre_dock.py --receptor protein.pdb --ligand ligand.sdf --mode rigid
+  python autopre_dock_fixed.py --receptor protein.pdb --ligand ligand.sdf --mode rigid
         """
     )
     
