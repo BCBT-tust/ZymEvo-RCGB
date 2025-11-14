@@ -186,9 +186,17 @@ class VinaDocking:
             output_file = f"results/{output_name}.pdbqt"
             log_file = f"results/{output_name}.log"
             
-            # Use parameters from config file if available, otherwise use defaults
-            ex = params.get('exhaustiveness', exhaustiveness)
-            nm = params.get('num_modes', num_modes)
+            # Use command-line parameters if provided, otherwise use config file values
+            # Command-line parameters OVERRIDE config file parameters
+            if exhaustiveness is not None and exhaustiveness > 0:
+                ex = exhaustiveness  # Use命令行参数
+            else:
+                ex = params.get('exhaustiveness', 8)  # 使用配置文件或默认值
+            
+            if num_modes is not None and num_modes > 0:
+                nm = num_modes  # Use命令行参数  
+            else:
+                nm = params.get('num_modes', 10)  # 使用配置文件或默认值
             
             # Build Vina command
             cmd = [
