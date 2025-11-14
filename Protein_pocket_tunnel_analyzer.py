@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Protein Structure Analyzer - Batch Processing of protein pockets and tunnels
-
+Protein Structure Analyzer - Batch Processing for P2Rank and MOLE2
+Author: Jackzhoucr
+Description: Core logic for batch analysis of protein pockets and tunnels
 """
 
 import os
@@ -15,7 +16,7 @@ import re
 
 
 class ProteinAnalyzer:
-    """蛋白质结构分析 - 整合P2Rank和MOLE2"""
+    """蛋白质结构分析器 - 整合P2Rank和MOLE2"""
     
     def __init__(self, work_dir: str = "/content/protein_analysis"):
         """
@@ -68,8 +69,7 @@ class ProteinAnalyzer:
             result = subprocess.run(
                 ["java", "-version"],
                 capture_output=True,
-                text=True,
-                stderr=subprocess.STDOUT
+                text=True
             )
             if result.returncode == 0:
                 print("✅ Java already installed")
@@ -81,12 +81,12 @@ class ProteinAnalyzer:
         subprocess.run(
             ["apt-get", "update", "-qq"],
             check=True,
-            stdout=subprocess.DEVNULL
+            capture_output=True
         )
         subprocess.run(
             ["apt-get", "install", "-y", "-qq", "openjdk-11-jdk"],
             check=True,
-            stdout=subprocess.DEVNULL
+            capture_output=True
         )
         print("✅ Java installed successfully")
     
