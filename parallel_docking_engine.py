@@ -2,6 +2,7 @@
 """
 ZymEvo Parallel Docking Engine
 High-throughput molecular docking with AutoDock Vina
+
 Version: 2.0
 """
 
@@ -21,6 +22,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
 class VinaInstaller:
+    """AutoDock Vina installer"""
     
     VINA_URL = "https://github.com/ccsb-scripps/AutoDock-Vina/releases/download/v1.2.5/vina_1.2.5_linux_x86_64"
     VINA_BINARY = "vina"
@@ -33,12 +35,14 @@ class VinaInstaller:
         if vina_path:
             print(f"  ✅ Vina found: {vina_path}")
             return vina_path
-
+        
+        # Check local directory
         local_vina = os.path.join(work_dir, VinaInstaller.VINA_BINARY)
         if os.path.exists(local_vina) and os.access(local_vina, os.X_OK):
             print(f"  ✅ Vina found: {local_vina}")
             return local_vina
         
+        # Download Vina
         print("  📥 Downloading AutoDock Vina v1.2.5...")
         try:
             download_path = os.path.join(work_dir, "vina_download")
@@ -58,6 +62,7 @@ class VinaInstaller:
 
 
 class SystemResources:
+    """System resource detection and management"""
     
     def __init__(self):
         self.cpu_count = multiprocessing.cpu_count()
@@ -91,6 +96,7 @@ class ParameterReader:
     """Docking parameter file reader"""
     
     REQUIRED_PARAMS = ['center_x', 'center_y', 'center_z', 'size_x', 'size_y', 'size_z']
+    OPTIONAL_PARAMS = ['exhaustiveness', 'num_modes', 'energy_range']
     
     @staticmethod
     def read_parameters(param_file: str) -> Optional[Dict[str, float]]:
@@ -110,10 +116,19 @@ class ParameterReader:
                     if '=' in line:
                         key, value = line.split('=', 1)
                         key = key.strip()
+                        value = value.strip()
                         
+                        # Read required parameters
                         if key in ParameterReader.REQUIRED_PARAMS:
-                            params[key] = float(value.strip())
+                            params[key] = float(value)
+                        # Read optional Vina parameters
+                        elif key in ParameterReader.OPTIONAL_PARAMS:
+                            try:
+                                params[key] = int(value) if key in ['exhaustiveness', 'num_modes'] else float(value)
+                            except:
+                                params[key] = float(value)
             
+            # Validate all required parameters present
             missing = [p for p in ParameterReader.REQUIRED_PARAMS if p not in params]
             if missing:
                 print(f"  ⚠️  Missing parameters in {param_file}: {missing}")
@@ -127,27 +142,38 @@ class ParameterReader:
     
     @staticmethod
     def find_matching_parameter(receptor_name: str, param_files: List[str]) -> Optional[str]:
+        """Find matching parameter file for receptor"""
         receptor_base = Path(receptor_name).stem.lower()
         
+        # Try exact or partial match
         for param_file in param_files:
             param_base = Path(param_file).stem.lower()
             
+            # Remove common suffixes
             receptor_clean = receptor_base.replace('_receptor', '').replace('_protein', '')
             param_clean = param_base.replace('_docking_params', '').replace('_params', '')
             
             if receptor_clean == param_clean or receptor_clean in param_clean or param_clean in receptor_clean:
                 return param_file
-
+        
+        # Fallback: use first parameter file
         return param_files[0] if param_files else None
 
 
 class VinaDocking:
+    """Single Vina docking execution"""
     
     @staticmethod
     def run_docking(receptor: str, ligand: str, params: Dict[str, float], 
                    vina_path: str, cores: int = 1, 
                    exhaustiveness: int = 8, num_modes: int = 10,
                    timeout: int = 300) -> Dict:
+        """
+        Run single docking job
+        
+        Returns:
+            Result dictionary with status, output path, and metadata
+        """
         try:
             # Generate output paths
             receptor_name = Path(receptor).stem
@@ -159,6 +185,10 @@ class VinaDocking:
             
             output_file = f"results/{output_name}.pdbqt"
             log_file = f"results/{output_name}.log"
+            
+            # Use parameters from config file if available, otherwise use defaults
+            ex = params.get('exhaustiveness', exhaustiveness)
+            nm = params.get('num_modes', num_modes)
             
             # Build Vina command
             cmd = [
@@ -173,9 +203,14 @@ class VinaDocking:
                 "--size_z", str(params['size_z']),
                 "--out", output_file,
                 "--cpu", str(cores),
-                "--exhaustiveness", str(exhaustiveness),
-                "--num_modes", str(num_modes)
+                "--exhaustiveness", str(int(ex)),
+                "--num_modes", str(int(nm))
             ]
+            
+            # Add energy_range if specified in params
+            if 'energy_range' in params:
+                cmd.extend(["--energy_range", str(params['energy_range'])])
+
             
             # Execute docking
             start_time = time.time()
@@ -190,6 +225,7 @@ class VinaDocking:
             
             elapsed = time.time() - start_time
             
+            # Check success
             if result.returncode == 0 and os.path.exists(output_file):
                 # Extract best score from log
                 best_score = VinaDocking.extract_best_score(log_file)
@@ -229,6 +265,7 @@ class VinaDocking:
     
     @staticmethod
     def extract_best_score(log_file: str) -> Optional[float]:
+        """Extract best docking score from log file"""
         try:
             with open(log_file, 'r') as f:
                 lines = f.readlines()
@@ -248,11 +285,14 @@ class VinaDocking:
 
 
 class ParallelDockingEngine:
+    """Main parallel docking engine"""
     
     def __init__(self, work_dir: str = "."):
+        """Initialize docking engine"""
         self.work_dir = work_dir
         self.start_time = datetime.now()
         
+        # Setup resources
         self.resources = SystemResources()
         
         # Ensure Vina is available
@@ -262,7 +302,13 @@ class ParallelDockingEngine:
     
     def prepare_tasks(self, receptor_dir: str, ligand_dir: str, 
                      param_dir: str) -> List[Tuple]:
-
+        """
+        Prepare docking tasks from input directories
+        
+        Returns:
+            List of (receptor, ligand, params) tuples
+        """
+        # Get file lists
         receptors = glob.glob(os.path.join(receptor_dir, "*.pdbqt"))
         ligands = glob.glob(os.path.join(ligand_dir, "*.pdbqt"))
         parameters = glob.glob(os.path.join(param_dir, "*.txt"))
@@ -282,6 +328,7 @@ class ParallelDockingEngine:
         # Build task list
         tasks = []
         skipped = 0
+        param_info_shown = False
         
         for receptor in receptors:
             # Find matching parameters
@@ -297,6 +344,15 @@ class ParallelDockingEngine:
                 skipped += 1
                 continue
             
+            # Show parameter info once
+            if not param_info_shown:
+                print(f"\n⚙️  Vina parameters (from config file):")
+                print(f"   • Exhaustiveness: {params.get('exhaustiveness', 'default (8)')}")
+                print(f"   • Num modes: {params.get('num_modes', 'default (10)')}")
+                if 'energy_range' in params:
+                    print(f"   • Energy range: {params['energy_range']}")
+                param_info_shown = True
+            
             # Add task for each ligand
             for ligand in ligands:
                 tasks.append((receptor, ligand, params))
@@ -310,7 +366,12 @@ class ParallelDockingEngine:
                     exhaustiveness: int = 8,
                     num_modes: int = 10,
                     timeout: int = 300) -> Tuple[List[Dict], List[Dict]]:
-
+        """
+        Execute docking tasks in parallel
+        
+        Returns:
+            (successful_results, failed_results)
+        """
         total_tasks = len(tasks)
         
         if total_tasks == 0:
@@ -332,6 +393,7 @@ class ParallelDockingEngine:
             for r, l, p in tasks
         ]
         
+        # Execute in parallel
         successful = []
         failed = []
         completed = 0
