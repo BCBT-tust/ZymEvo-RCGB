@@ -194,7 +194,7 @@ class ProteinAnalyzer:
                 str(prank_script),
                 "predict",
                 str(pdb_file),
-                "-f", str(pdb_file)
+                "-f", str(pdb_file),
                 "-o", str(output_subdir),
                 "-threads", "2"
             ]
