@@ -20,7 +20,7 @@ class ProteinAnalyzer:
         self.caver_output = self.output_dir / "caver"
 
         self.p2rank_path = self.work_dir / "p2rank_2.4.2"
-        self.caver_path = self.work_dir  
+        self.caver_path = self.work_dir
 
         self._create_directories()
         
@@ -56,7 +56,6 @@ class ProteinAnalyzer:
         print("✅ Java installed successfully")
     
     def _download_p2rank(self):
-        
         print("\n📦 Downloading P2Rank v2.4.2...")
         
         if self.p2rank_path.exists():
@@ -118,7 +117,6 @@ class ProteinAnalyzer:
         except Exception as e:
             print(f"❌ Failed to install CAVER 3.0.2: {e}")
             raise
-
 
     def run_p2rank(self, pdb_files: List[str] = None,
                    min_score: float = 0.0,
@@ -206,8 +204,11 @@ class ProteinAnalyzer:
             return pocket_info
         
         try:
-            df = pd.read_csv(csv_files[0])
+            # 使用skipinitialspace=True处理逗号后的空格
+            df = pd.read_csv(csv_files[0], skipinitialspace=True)
+            
             print(f"      📄 CSV: {csv_files[0].name} ({len(df)} pockets)")
+            print(f"      📋 Columns: {list(df.columns)}")
 
             pocket_info["summary"] = {
                 "total_pockets": len(df),
@@ -215,18 +216,29 @@ class ProteinAnalyzer:
             }
 
             for idx, row in df.iterrows():
-                pocket = {
-                    "name": str(row.get("name", f"pocket{idx+1}")),
-                    "rank": int(row.get("rank", idx + 1)),
-                    "score": float(row.get("score", 0.0)),
-                    "probability": float(row.get("probability", 0.0)),
-                    "sas_points": int(row.get("sas_points", row.get("sas_poin", 0))),
-                    "surf_atoms": int(row.get("surf_atoms", row.get("surf_ato", 0))),
-                    "center_x": float(row.get("center_x", 0.0)),
-                    "center_y": float(row.get("center_y", 0.0)),
-                    "center_z": float(row.get("center_z", 0.0)),
-                }
-                pocket_info["pockets"].append(pocket)
+                try:
+                    pocket = {
+                        "name": str(row.get("name", f"pocket{idx+1}")).strip(),
+                        "rank": int(row.get("rank", idx + 1)),
+                        "score": float(row.get("score", 0.0)),
+                        "probability": float(row.get("probability", 0.0)),
+                        "sas_points": int(row.get("sas_points", row.get("sas_poin", 0))),
+                        "surf_atoms": int(row.get("surf_atoms", row.get("surf_ato", 0))),
+                        "center_x": float(row.get("center_x", 0.0)),
+                        "center_y": float(row.get("center_y", 0.0)),
+                        "center_z": float(row.get("center_z", 0.0)),
+                    }
+                    
+                    if "residue_ids" in df.columns and pd.notna(row["residue_ids"]):
+                        pocket["residues"] = str(row["residue_ids"]).strip()
+                    else:
+                        pocket["residues"] = ""
+                    
+                    pocket_info["pockets"].append(pocket)
+                    
+                except (ValueError, TypeError) as e:
+                    print(f"      ⚠️  Warning parsing pocket {idx+1}: {e}")
+                    continue
 
             if pocket_info["pockets"]:
                 top = pocket_info["pockets"][0]
@@ -237,6 +249,8 @@ class ProteinAnalyzer:
         except Exception as e:
             pocket_info["parse_error"] = str(e)
             print(f"      ❌ Failed to parse CSV: {e}")
+            import traceback
+            traceback.print_exc()
 
         return pocket_info
 
@@ -253,12 +267,25 @@ class ProteinAnalyzer:
         
         top = pocket_info["pockets"][0]
 
-        if top["score"] < 2.0:
+        if top["score"] == 0.0:
+            warnings.append("Zero score - parsing error")
+            quality = "failed"
+        elif top["score"] < 2.0:
             warnings.append(f"Low score {top['score']:.2f}")
+            quality = "low"
+        elif top["score"] < 5.0:
+            warnings.append(f"Medium score {top['score']:.2f}")
             quality = "medium"
+            
         if top["probability"] < 0.3:
-            warnings.append("Low probability")
-            quality = "medium"
+            warnings.append(f"Low probability {top['probability']:.3f}")
+            if quality == "high":
+                quality = "medium"
+
+        coords_sum = abs(top["center_x"]) + abs(top["center_y"]) + abs(top["center_z"])
+        if coords_sum == 0.0:
+            warnings.append("Center at origin (0,0,0)")
+            quality = "failed"
 
         return {"quality": quality, "warnings": warnings}
 
@@ -295,16 +322,19 @@ class ProteinAnalyzer:
             output_subdir = self.caver_output / pdb_file.stem
             output_subdir.mkdir(exist_ok=True)
 
-            cmd = ["java", "-jar", str(caver_jar), "-p", str(pdb_file),
-                   "-out", str(output_subdir), "-pr", str(probe_radius)]
-
+            cmd = ["java", "-jar", str(caver_jar), 
+                   "-pdb", str(pdb_file),
+                   "-out", str(output_subdir)]
+            
             if use_p2rank_pockets:
                 start_point = self._get_p2rank_start_point(pdb_file.stem)
                 if start_point:
-                    cmd.extend(["-s",
-                                f"{start_point[0]:.2f}",
-                                f"{start_point[1]:.2f}",
-                                f"{start_point[2]:.2f}"])
+                    config_file = self._create_caver_config(
+                        output_subdir, 
+                        start_point, 
+                        probe_radius
+                    )
+                    cmd.extend(["-conf", str(config_file)])
                     print(f"   ✓ Using P2Rank pocket center {start_point}")
                 else:
                     print("   ⚠ No P2Rank start point — auto mode")
@@ -316,15 +346,21 @@ class ProteinAnalyzer:
                     print("   ✓ CAVER completed")
                     tunnel_info = self._parse_caver_results(output_subdir, pdb_file.stem)
                     results[pdb_file.stem] = tunnel_info
+                    
+                    tunnel_count = tunnel_info.get("summary", {}).get("tunnel_count", 0)
+                    print(f"      Found {tunnel_count} tunnel(s)")
 
                 else:
                     print("   ❌ CAVER failed")
-                    print(result.stderr[:200])
+                    print(f"      Error: {result.stderr[:200]}")
                     results[pdb_file.stem] = {"error": result.stderr}
 
             except subprocess.TimeoutExpired:
                 print("   ⏱ Timeout")
                 results[pdb_file.stem] = {"error": "Timeout"}
+            except Exception as e:
+                print(f"   ❌ Error: {str(e)}")
+                results[pdb_file.stem] = {"error": str(e)}
 
         print("\n" + "=" * 70)
         print("✅ CAVER tunnel detection completed!")
@@ -332,33 +368,58 @@ class ProteinAnalyzer:
 
         return results
 
-    def _find_caver_jar(self) -> Optional[Path]:
+    def _create_caver_config(self, output_dir: Path, 
+                            start_point: Tuple[float, float, float],
+                            probe_radius: float) -> Path:
+                                
+        config_file = output_dir / "caver_config.txt"
+        
+        config_content = f"""# CAVER 3.0 Configuration
+starting_point_x {start_point[0]:.3f}
+starting_point_y {start_point[1]:.3f}
+starting_point_z {start_point[2]:.3f}
+probe_radius {probe_radius}
+shell_depth 4
+shell_radius 3
+max_distance 3
+"""
+        
+        with open(config_file, 'w') as f:
+            f.write(config_content)
+        
+        return config_file
 
+    def _find_caver_jar(self) -> Optional[Path]:
         candidates = list(self.work_dir.rglob("caver.jar"))
         if not candidates:
             return None
         return candidates[0]
 
     def _get_p2rank_start_point(self, pdb_name: str) -> Optional[Tuple[float, float, float]]:
-
         p2rank_dir = self.p2rank_output / pdb_name
         csv_files = list(p2rank_dir.glob("*predictions.csv"))
         if not csv_files:
             return None
 
-        df = pd.read_csv(csv_files[0])
-        if df.empty:
-            return None
-        
-        row = df.iloc[0]
-        x, y, z = row.get("center_x", 0), row.get("center_y", 0), row.get("center_z", 0)
-        if x == 0 and y == 0 and z == 0:
-            return None
+        try:
+            df = pd.read_csv(csv_files[0], skipinitialspace=True)
+            if df.empty:
+                return None
+            
+            row = df.iloc[0]
+            x = float(row.get("center_x", 0))
+            y = float(row.get("center_y", 0))
+            z = float(row.get("center_z", 0))
+            
+            if x == 0 and y == 0 and z == 0:
+                return None
 
-        return (float(x), float(y), float(z))
+            return (x, y, z)
+        except Exception as e:
+            print(f"      ⚠️ Failed to get start point: {e}")
+            return None
 
     def _parse_caver_results(self, output_dir: Path, pdb_name: str) -> Dict:
-
         tunnel_files = list(output_dir.glob("tunnel_*.pdb"))
 
         return {
@@ -380,12 +441,40 @@ class ProteinAnalyzer:
             r1 = p2rank_results.get(p, {})
             r2 = caver_results.get(p, {})
 
+            top_score = 0.0
+            top_prob = 0.0
+            top_center_x = 0.0
+            top_center_y = 0.0
+            top_center_z = 0.0
+            quality = "unknown"
+            warnings_str = ""
+            
+            if r1.get("pockets"):
+                top = r1["pockets"][0]
+                top_score = top.get("score", 0.0)
+                top_prob = top.get("probability", 0.0)
+                top_center_x = top.get("center_x", 0.0)
+                top_center_y = top.get("center_y", 0.0)
+                top_center_z = top.get("center_z", 0.0)
+            
+            if r1.get("validation"):
+                quality = r1["validation"].get("quality", "unknown")
+                warnings = r1["validation"].get("warnings", [])
+                warnings_str = "; ".join(warnings[:3])  # 最多3个警告
+
             row = {
                 "Protein": p,
                 "Total_Pockets": r1.get("summary", {}).get("total_pockets", 0),
+                "Top_Pocket_Score": top_score,
+                "Top_Pocket_Probability": top_prob,
+                "Pocket_Center_X": top_center_x,
+                "Pocket_Center_Y": top_center_y,
+                "Pocket_Center_Z": top_center_z,
                 "Tunnel_Count": r2.get("summary", {}).get("tunnel_count", 0),
-                "Status_P2Rank": "OK" if "error" not in r1 else "FAILED",
-                "Status_CAVER": "OK" if "error" not in r2 else "FAILED",
+                "P2Rank_Status": "Success" if "error" not in r1 and "parse_error" not in r1 else "Failed",
+                "CAVER_Status": "Success" if "error" not in r2 else "Failed",
+                "Quality": quality,
+                "Warnings": warnings_str
             }
             report.append(row)
 
@@ -395,15 +484,11 @@ class ProteinAnalyzer:
         print("✅ Summary saved")
         return df
 
-
-
     def save_detailed_results(self, p2rank_results: Dict, caver_results: Dict):
         data = {"p2rank": p2rank_results, "caver": caver_results}
         with open(self.output_dir / "detailed_results.json", "w") as f:
             json.dump(data, f, indent=2)
         print("📄 Detailed results saved")
-
-
 
 
 def main():
