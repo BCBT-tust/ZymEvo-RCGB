@@ -57,20 +57,19 @@ class ProteinAnalyzer:
         print("✅ Java installed successfully")
     
     def _download_p2rank(self):
-        print("\n📦 Downloading P2Rank v2.4.2 (with mirror)...")
+        print("\n📦 Downloading P2Rank v2.4.2")
         
         if self.p2rank_path.exists():
             print("✅ P2Rank already exists")
             return
         
-        mirrors = [
-            "https://ghproxy.com/https://github.com/rdk/p2rank/releases/download/2.4.2/p2rank_2.4.2.tar.gz",
-            "https://mirror.ghproxy.com/https://github.com/rdk/p2rank/releases/download/2.4.2/p2rank_2.4.2.tar.gz"
+        url = [
+            "https://github.com/rdk/p2rank/releases/download/2.4.2/p2rank_2.4.2.tar.gz"
         ]
         tar_path = self.work_dir / "p2rank.tar.gz"
 
-        for url in mirrors:
-            print(f"⏳ Trying mirror: {url}")
+        for url in url:
+            print(f"⏳ Trying: {url}")
             try:
                 subprocess.run(
                     ["wget", "-O", str(tar_path), url],
@@ -94,9 +93,9 @@ class ProteinAnalyzer:
                 return
 
             except Exception as e:
-                print(f"⚠️ Mirror failed: {e}")
+                print(f"⚠️ url failed: {e}")
         
-        raise RuntimeError("❌ All P2Rank download mirrors failed.")
+        raise RuntimeError("❌ P2Rank download failed.")
     
     def _download_caver(self):
         print("\n📦 Downloading CAVER 3.0.2 (ZIP version)...")
