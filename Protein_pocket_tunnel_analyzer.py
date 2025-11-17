@@ -55,48 +55,42 @@ class ProteinAnalyzer:
         subprocess.run(["apt-get", "update", "-qq"], check=True)
         subprocess.run(["apt-get", "install", "-y", "-qq", "openjdk-11-jdk"], check=True)
         print("✅ Java installed successfully")
-    
+
     def _download_p2rank(self):
         print("\n📦 Downloading P2Rank v2.4.2")
-        
+
         if self.p2rank_path.exists():
             print("✅ P2Rank already exists")
             return
-        
-        url = [
-            "https://github.com/rdk/p2rank/releases/download/2.4.2/p2rank_2.4.2.tar.gz"
-        ]
+
+        url = "https://github.com/rdk/p2rank/releases/download/2.4.2/p2rank_2.4.2.tar.gz"
         tar_path = self.work_dir / "p2rank.tar.gz"
 
-        for url in url:
-            print(f"⏳ Trying: {url}")
-            try:
-                subprocess.run(
-                    ["wget", "-O", str(tar_path), url],
-                    check=True,
-                    timeout=600
-                )
-                if not tar_path.exists():
-                    print("⚠️ File not created, trying next mirror...")
-                    continue
-                if os.path.getsize(tar_path) < 100_000_000:
-                    print("⚠️ File too small (<100MB), maybe HTML error. Trying next mirror...")
-                    continue
+        print(f"⏳ Downloading P2Rank from official GitHub")
+        try:
+            subprocess.run(
+                ["wget", "-O", str(tar_path), url],
+                check=True,
+                timeout=600
+            )
+        except Exception as e:
+            raise RuntimeError(f"❌ Failed to download P2Rank: {e}")
 
-                print("📦 Extracting P2Rank...")
-                subprocess.run(
-                    ["tar", "-xzf", str(tar_path), "-C", str(self.work_dir)],
-                    check=True
-                )
-                tar_path.unlink(missing_ok=True)
-                print("✅ P2Rank downloaded and extracted successfully")
-                return
+        if not tar_path.exists() or os.path.getsize(tar_path) < 50_000_000:
+            raise RuntimeError("❌ Downloaded P2Rank file is too small, possibly failed.")
 
-            except Exception as e:
-                print(f"⚠️ url failed: {e}")
-        
-        raise RuntimeError("❌ P2Rank download failed.")
-    
+        print("📦 Extracting P2Rank...")
+        try:
+            subprocess.run(
+                ["tar", "-xzf", str(tar_path), "-C", str(self.work_dir)],
+                check=True
+            )
+        except Exception as e:
+            raise RuntimeError(f"❌ Failed to extract P2Rank: {e}")
+
+        tar_path.unlink(missing_ok=True)
+        print("✅ P2Rank downloaded and extracted successfully")
+
     def _download_caver(self):
         print("\n📦 Downloading CAVER 3.0.2 (ZIP version)...")
 
@@ -110,29 +104,30 @@ class ProteinAnalyzer:
         zip_path = self.work_dir / "caver.zip"
 
         try:
-            subprocess.run(["wget", "-q", "-O", str(zip_path), caver_url],
-                           check=True,
-                           timeout=300)
-
-            if os.path.getsize(zip_path) < 50_000:
-                raise RuntimeError("Downloaded CAVER zip is too small, maybe HTML error.")
-
-            subprocess.run(["unzip", "-o", str(zip_path), "-d", str(self.work_dir)],
-                           check=True)
-            zip_path.unlink(missing_ok=True)
-
-            jar_files = list(self.work_dir.rglob("caver.jar"))
-            if not jar_files:
-                raise FileNotFoundError("caver.jar not found after extraction")
-
-            self.caver_path = jar_files[0].parent
-            print(f"   ✓ Found caver.jar at: {self.caver_path}")
-            print("✅ CAVER 3.0.2 installed successfully")
-
+            subprocess.run(
+                ["wget", "-q", "-O", str(zip_path), caver_url],
+                check=True,
+                timeout=300
+            )
         except Exception as e:
-            print(f"❌ Failed to install CAVER 3.0.2: {e}")
-            raise
-            
+            raise RuntimeError(f"❌ Failed to download CAVER 3.0.2: {e}")
+
+        if os.path.getsize(zip_path) < 50_000:
+            raise RuntimeError("❌ CAVER zip too small, download likely failed.")
+
+        print("📦 Extracting CAVER...")
+        subprocess.run(["unzip", "-o", str(zip_path), "-d", str(self.work_dir)],
+                       check=True)
+        zip_path.unlink(missing_ok=True)
+
+        jar_files = list(self.work_dir.rglob("caver.jar"))
+        if not jar_files:
+            raise FileNotFoundError("❌ caver.jar not found after extraction")
+
+        self.caver_path = jar_files[0].parent
+        print(f"   ✓ Found caver.jar at: {self.caver_path}")
+        print("✅ CAVER 3.0.2 installed successfully")
+
     def run_p2rank(self, pdb_files: List[str] = None,
                    min_score: float = 0.0,
                    threads: int = 2) -> Dict[str, Dict]:
@@ -213,6 +208,7 @@ class ProteinAnalyzer:
         
         try:
             df = pd.read_csv(csv_files[0], skipinitialspace=True)
+
             pocket_info["summary"] = {
                 "total_pockets": len(df),
                 "output_file": str(csv_files[0])
@@ -233,9 +229,11 @@ class ProteinAnalyzer:
 
             if pocket_info["pockets"]:
                 top = pocket_info["pockets"][0]
-                print(f"      ✓ Top pocket: score={top['score']:.2f}, "
-                      f"prob={top['probability']:.3f}, "
-                      f"center=({top['center_x']:.1f}, {top['center_y']:.1f}, {top['center_z']:.1f})")
+                print(
+                    f"      ✓ Top pocket: score={top['score']:.2f}, "
+                    f"prob={top['probability']:.3f}, "
+                    f"center=({top['center_x']:.1f}, {top['center_y']:.1f}, {top['center_z']:.1f})"
+                )
 
         except Exception as e:
             pocket_info["parse_error"] = str(e)
@@ -243,10 +241,9 @@ class ProteinAnalyzer:
         
         return pocket_info
 
+
     def _get_atoms_from_residue_ids(self, pdb_file: Path, pdb_name: str) -> Optional[List[int]]:
-        """
-        使用 P2Rank 输出的 residue_ids，从 PDB 中找出对应残基的所有原子编号。
-        """
+
         p2rank_dir = self.p2rank_output / pdb_name
         csv_files = list(p2rank_dir.glob("*predictions.csv")) or list(p2rank_dir.glob("*.csv"))
         if not csv_files:
@@ -264,16 +261,18 @@ class ProteinAnalyzer:
                 print("   ⚠️ No residue_ids in P2Rank output")
                 return None
 
+            # A_103 A_231 A_235 ...
             residues = []
             for item in residues_str.split():
-                try:
+                if "_" in item:
                     chain, num = item.split("_")
-                    residues.append((chain, int(num)))
-                except Exception:
-                    continue
+                    try:
+                        residues.append((chain, int(num)))
+                    except:
+                        pass
 
             if not residues:
-                print("   ⚠️ No valid residue_ids parsed")
+                print("   ⚠️ Failed to parse residue_ids field")
                 return None
 
             found_atoms: List[int] = []
@@ -281,11 +280,12 @@ class ProteinAnalyzer:
                 for line in f:
                     if not (line.startswith("ATOM") or line.startswith("HETATM")):
                         continue
-                    chain = line[21].strip()
+
                     try:
+                        chain = line[21].strip()
                         resid = int(line[22:26])
                         atom_id = int(line[6:11])
-                    except Exception:
+                    except:
                         continue
 
                     if (chain, resid) in residues:
@@ -295,7 +295,9 @@ class ProteinAnalyzer:
                 print("   ⚠️ No atoms matched residue_ids in PDB")
                 return None
 
-            print(f"   ✓ Using {len(found_atoms)} atoms from {len(residues)} residues (from residue_ids)")
+            print(
+                f"   ✓ Using {len(found_atoms)} atoms from {len(residues)} residues (from residue_ids)"
+            )
             return found_atoms
 
         except Exception as e:
@@ -347,7 +349,7 @@ class ProteinAnalyzer:
             cmd = [
                 "java", "-jar", str(caver_jar),
                 "-home", str(caver_jar.parent),
-                "-pdb", str(pdb),
+                "-pdb", str(pdb.parent),  # ⚠ FIX: must be directory, not file
                 "-conf", str(config_file),
                 "-out", str(output_subdir),
             ]
@@ -388,17 +390,17 @@ class ProteinAnalyzer:
         config_file = output_dir / "config.txt"
 
         txt = """#*****************************
-# CALCULATION SETUP      
+# CALCULATION SETUP
 #*****************************
 load_tunnels no
 load_cluster_tree no
 
 #*****************************
-# INPUT DATA       
+# INPUT DATA
 #*****************************
 time_sparsity 1
 first_frame 1
-last_frame 10
+last_frame 1 #如果有MD多个pdb文件，可以修改为10
 
 #*****************************
 # TUNNEL CALCULATION
@@ -411,7 +413,7 @@ last_frame 10
         txt += f"""
 probe_radius {probe_radius}
 shell_radius 3
-shell_depth 4 
+shell_depth 4
 
 #*****************************
 # TUNNEL CLUSTERING
