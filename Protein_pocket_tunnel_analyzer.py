@@ -191,7 +191,7 @@ class ProteinAnalyzer:
                     
                     if validation["warnings"]:
                         print(f"   ⚠️  Quality: {validation['quality']}")
-                        for warning in validation["warnings"][:2]:  # 只显示前2个警告
+                        for warning in validation["warnings"][:2]:  
                             print(f"      - {warning}")
                     else:
                         print(f"   ✓ Quality: {validation['quality']}")
