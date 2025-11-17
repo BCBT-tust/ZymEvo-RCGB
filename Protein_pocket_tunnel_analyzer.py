@@ -4,6 +4,7 @@ import os
 import subprocess
 import json
 import pandas as pd
+import numpy as np
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import shutil
@@ -40,7 +41,7 @@ class ProteinAnalyzer:
         
         print("\n✅ Environment setup completed!")
         print("=" * 70)
-    
+
     def _install_java(self):
         print("\n☕ Installing Java...")
         try:
@@ -57,32 +58,32 @@ class ProteinAnalyzer:
     
     def _download_p2rank(self):
         print("\n📦 Downloading P2Rank v2.4.2...")
-        
+
         if self.p2rank_path.exists():
             print("✅ P2Rank already exists")
             return
         
         p2rank_url = "https://github.com/rdk/p2rank/releases/download/2.4.2/p2rank_2.4.2.tar.gz"
-        
-        try:
-            subprocess.run(
-                ["wget", "-q", "-O", f"{self.work_dir}/p2rank.tar.gz", p2rank_url],
-                check=True,
-                timeout=120
-            )
-            
-            subprocess.run(
-                ["tar", "-xzf", f"{self.work_dir}/p2rank.tar.gz", "-C", str(self.work_dir)],
-                check=True
-            )
-            
-            os.remove(f"{self.work_dir}/p2rank.tar.gz")
-            
-            print("✅ P2Rank downloaded and extracted")
-            
-        except Exception as e:
-            print(f"❌ Failed to download P2Rank: {e}")
-            raise
+        tar_path = f"{self.work_dir}/p2rank.tar.gz"
+
+        print("⏳ Downloading from accelerated mirror...")
+        subprocess.run(
+            ["wget", "-O", tar_path, p2rank_url],
+            check=True,
+            timeout=600
+        )
+
+        if not os.path.exists(tar_path):
+            raise Exception("P2Rank download failed")
+
+        if os.path.getsize(tar_path) < 100_000_000:
+            raise Exception("P2Rank package too small - likely download error")
+
+        print("📦 Extracting P2Rank...")
+        subprocess.run(["tar", "-xzf", tar_path, "-C", str(self.work_dir)], check=True)
+        os.remove(tar_path)
+
+        print("✅ P2Rank downloaded and extracted")
 
     def _download_caver(self):
         print("\n📦 Downloading CAVER 3.0.2 (ZIP version)...")
@@ -96,27 +97,21 @@ class ProteinAnalyzer:
         caver_url = "https://www.caver.cz/fil/download/caver30/302/caver_3.0.2.zip"
         zip_path = f"{self.work_dir}/caver.zip"
 
-        try:
-            subprocess.run(["wget", "-q", "-O", zip_path, caver_url], check=True, timeout=120)
+        subprocess.run(["wget", "-q", "-O", zip_path, caver_url], check=True, timeout=120)
 
-            if os.path.getsize(zip_path) < 50000:
-                raise Exception("Downloaded CAVER ZIP too small — likely HTML error page.")
+        if os.path.getsize(zip_path) < 50000:
+            raise Exception("Downloaded CAVER ZIP too small")
 
-            subprocess.run(["unzip", "-o", zip_path, "-d", str(self.work_dir)], check=True)
-            os.remove(zip_path)
+        subprocess.run(["unzip", "-o", zip_path, "-d", str(self.work_dir)], check=True)
+        os.remove(zip_path)
 
-            jar_files = list(self.work_dir.rglob("caver.jar"))
-            if not jar_files:
-                raise FileNotFoundError("caver.jar not found after extraction")
+        jar_files = list(self.work_dir.rglob("caver.jar"))
+        if not jar_files:
+            raise FileNotFoundError("caver.jar not found")
 
-            self.caver_path = jar_files[0].parent
-
-            print(f"   ✓ Found caver.jar at: {self.caver_path}")
-            print("✅ CAVER 3.0.2 installed successfully")
-
-        except Exception as e:
-            print(f"❌ Failed to install CAVER 3.0.2: {e}")
-            raise
+        self.caver_path = jar_files[0].parent
+        print(f"   ✓ Found caver.jar at: {self.caver_path}")
+        print("✅ CAVER 3.0.2 installed successfully")
 
     def run_p2rank(self, pdb_files: List[str] = None,
                    min_score: float = 0.0,
@@ -153,38 +148,19 @@ class ProteinAnalyzer:
 
             if min_score > 0:
                 cmd.extend(["-min_score", str(min_score)])
-            
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
                 
-                if result.returncode == 0:
-                    print("   ✅ P2Rank completed")
+            if result.returncode == 0:
+                print("   ✅ P2Rank completed")
+                pocket_info = self._parse_p2rank_results(output_subdir, pdb_file.stem)
+                results[pdb_file.stem] = pocket_info
                     
-                    pocket_info = self._parse_p2rank_results(output_subdir, pdb_file.stem)
-                    validation = self.validate_p2rank_results(pocket_info, pdb_file)
-                    pocket_info["validation"] = validation
-                    
-                    if validation["warnings"]:
-                        print(f"   ⚠️  Quality: {validation['quality']}")
-                        for w in validation["warnings"][:2]:
-                            print(f"      - {w}")
-                    else:
-                        print(f"   ✓ Quality: {validation['quality']}")
-                    
-                    results[pdb_file.stem] = pocket_info
-                    
-                else:
-                    print("   ❌ P2Rank failed")
-                    print(f"   Error: {result.stderr[:200]}")
-                    results[pdb_file.stem] = {"error": result.stderr}
-                    
-            except subprocess.TimeoutExpired:
-                print("   ⏱️ Timeout (>300s)")
-                results[pdb_file.stem] = {"error": "Timeout"}
-            except Exception as e:
-                print(f"   ❌ Error: {str(e)}")
-                results[pdb_file.stem] = {"error": str(e)}
-        
+            else:
+                print("   ❌ P2Rank failed")
+                print(result.stderr[:200])
+                results[pdb_file.stem] = {"error": result.stderr}
+
         print("\n" + "=" * 70)
         print("✅ P2Rank analysis completed!")
         print("=" * 70)
@@ -192,291 +168,150 @@ class ProteinAnalyzer:
         return results
 
     def _parse_p2rank_results(self, output_dir: Path, pdb_name: str) -> Dict:
-        """修复版本:正确处理CSV中的空格"""
         pocket_info = {"pdb_name": pdb_name, "pockets": [], "summary": {}}
         
-        csv_pattern = f"{pdb_name}.pdb_predictions.csv"
-        csv_files = list(output_dir.glob(csv_pattern)) or \
-                    list(output_dir.glob("*predictions.csv")) or \
-                    list(output_dir.glob("*.csv"))
-
+        csv_files = list(output_dir.glob("*predictions.csv"))
         if not csv_files:
-            print(f"      ⚠️  No CSV file found in {output_dir}")
+            print(f"⚠️ No CSV found in {output_dir}")
             return pocket_info
         
-        try:
-            df = pd.read_csv(csv_files[0], skipinitialspace=True)
-            
-            print(f"      📄 CSV: {csv_files[0].name} ({len(df)} pockets)")
+        df = pd.read_csv(csv_files[0], skipinitialspace=True)
+        pocket_info["summary"] = {
+            "total_pockets": len(df),
+            "output_file": str(csv_files[0])
+        }
 
-            pocket_info["summary"] = {
-                "total_pockets": len(df),
-                "output_file": str(csv_files[0])
+        for idx, row in df.iterrows():
+            pocket = {
+                "name": row.get("name", f"pocket{idx+1}"),
+                "rank": int(row.get("rank", idx+1)),
+                "score": float(row.get("score", 0)),
+                "probability": float(row.get("probability", 0)),
+                "center_x": float(row.get("center_x", 0)),
+                "center_y": float(row.get("center_y", 0)),
+                "center_z": float(row.get("center_z", 0)),
+                "residue_ids": str(row.get("residue_ids", "")),
             }
-
-            for idx, row in df.iterrows():
-                try:
-                    pocket = {
-                        "name": str(row.get("name", f"pocket{idx+1}")).strip(),
-                        "rank": int(row.get("rank", idx + 1)),
-                        "score": float(row.get("score", 0.0)),
-                        "probability": float(row.get("probability", 0.0)),
-                        "sas_points": int(row.get("sas_points", row.get("sas_poin", 0))),
-                        "surf_atoms": int(row.get("surf_atoms", row.get("surf_ato", 0))),
-                        "center_x": float(row.get("center_x", 0.0)),
-                        "center_y": float(row.get("center_y", 0.0)),
-                        "center_z": float(row.get("center_z", 0.0)),
-                    }
-                    
-                    if "residue_ids" in df.columns and pd.notna(row["residue_ids"]):
-                        pocket["residues"] = str(row["residue_ids"]).strip()
-                    else:
-                        pocket["residues"] = ""
-                    
-                    pocket_info["pockets"].append(pocket)
-                    
-                except (ValueError, TypeError) as e:
-                    print(f"      ⚠️  Warning parsing pocket {idx+1}: {e}")
-                    continue
-
-            if pocket_info["pockets"]:
-                top = pocket_info["pockets"][0]
-                print(f"      ✓ Top pocket: score={top['score']:.2f}, "
-                      f"prob={top['probability']:.3f}, "
-                      f"center=({top['center_x']:.1f}, {top['center_y']:.1f}, {top['center_z']:.1f})")
-
-        except Exception as e:
-            pocket_info["parse_error"] = str(e)
-            print(f"      ❌ Failed to parse CSV: {e}")
+            pocket_info["pockets"].append(pocket)
 
         return pocket_info
 
-    def validate_p2rank_results(self, pocket_info: Dict, pdb_file: Path) -> Dict:
-        warnings = []
-        quality = "high"
-        
-        if "parse_error" in pocket_info:
-            warnings.append(f"Parse error: {pocket_info['parse_error']}")
-            return {"quality": "failed", "warnings": warnings}
-        
-        if not pocket_info.get("pockets"):
-            return {"quality": "low", "warnings": ["No pockets detected"]}
-        
-        top = pocket_info["pockets"][0]
+    def _get_atoms_from_residue_ids(self, pdb_file: Path, pdb_name: str) -> Optional[List[int]]:
 
-        if top["score"] == 0.0:
-            warnings.append("Zero score - parsing error")
-            quality = "failed"
-        elif top["score"] < 2.0:
-            warnings.append(f"Low score {top['score']:.2f}")
-            quality = "low"
-        elif top["score"] < 5.0:
-            warnings.append(f"Medium score {top['score']:.2f}")
-            quality = "medium"
-            
-        if top["probability"] < 0.3:
-            warnings.append(f"Low probability {top['probability']:.3f}")
-            if quality == "high":
-                quality = "medium"
+        p2rank_csv = list((self.p2rank_output / pdb_name).glob("*predictions.csv"))
+        if not p2rank_csv:
+            return None
 
-        coords_sum = abs(top["center_x"]) + abs(top["center_y"]) + abs(top["center_z"])
-        if coords_sum == 0.0:
-            warnings.append("Center at origin (0,0,0)")
-            quality = "failed"
+        df = pd.read_csv(p2rank_csv[0], skipinitialspace=True)
+        residues_str = str(df.iloc[0].get("residue_ids", "")).strip()
 
-        return {"quality": quality, "warnings": warnings}
+        if not residues_str:
+            return None
+
+        residues = []
+        for item in residues_str.split():
+            try:
+                chain, num = item.split("_")
+                residues.append((chain, int(num)))
+            except:
+                pass
+
+        found_atoms = []
+        with open(pdb_file, "r") as f:
+            for line in f:
+                if not (line.startswith("ATOM") or line.startswith("HETATM")):
+                    continue
+                
+                chain = line[21].strip()
+                try:
+                    resid = int(line[22:26])
+                    atom_id = int(line[6:11])
+                except:
+                    continue
+
+                if (chain, resid) in residues:
+                    found_atoms.append(atom_id)
+
+        print(f"   ✓ Using {len(found_atoms)} atoms from {len(residues)} pocket residues")
+        return found_atoms
 
     def run_caver(self, pdb_files: List[str] = None,
                   use_p2rank_pockets: bool = True,
-                  probe_radius: float = 0.9,
-                  max_distance: float = 3.0) -> Dict[str, Dict]:
+                  atom_id_strategy: str = "use_residue_ids",
+                  probe_radius: float = 0.9) -> Dict[str, Dict]:
 
         print("\n" + "=" * 70)
         print("🌀 Running CAVER 3.0.2 Analysis...")
         print("=" * 70)
-        
+
         if pdb_files is None:
             pdb_files = list(self.input_dir.glob("*.pdb"))
         else:
             pdb_files = [Path(f) for f in pdb_files]
 
-        if not pdb_files:
-            print("⚠️ No PDB files found!")
-            return {}
-        
-        results = {}
-        
         caver_jar = self._find_caver_jar()
-        if caver_jar is None:
-            print("❌ CAVER JAR file not found!")
+        if not caver_jar:
+            print("❌ caver.jar not found")
             return {}
-        
-        print(f"✅ Using CAVER JAR: {caver_jar}")
 
-        for i, pdb_file in enumerate(pdb_files, 1):
-            print(f"\n[{i}/{len(pdb_files)}] 🌀 {pdb_file.name}")
+        results = {}
 
-            output_subdir = self.caver_output / pdb_file.stem
+        for pdb in pdb_files:
+            pdb_name = pdb.stem
+            print(f"\n🌀 Processing {pdb.name}")
+
+            start_atoms = self._get_atoms_from_residue_ids(pdb, pdb_name)
+            if not start_atoms:
+                print("⚠️ No residue-based atoms, fallback to atom 1")
+                start_atoms = [1]
+
+            output_subdir = self.caver_output / pdb_name
             output_subdir.mkdir(exist_ok=True)
 
-            temp_pdb_dir = output_subdir / "pdb_input"
-            temp_pdb_dir.mkdir(exist_ok=True)
-            
-            temp_pdb_file = temp_pdb_dir / pdb_file.name
-            shutil.copy2(pdb_file, temp_pdb_file)
-
-            start_point = None
-            if use_p2rank_pockets:
-                start_point = self._get_p2rank_start_point(pdb_file.stem)
-
-            config_file = self._create_caver_config(
-                output_subdir,
-                start_point,
-                probe_radius,
-                max_distance
-            )
-            
-            if start_point:
-                print(f"   ✓ Using P2Rank pocket center {start_point}")
-            else:
-                print("   ⚠ Auto-detection mode")
+            config_file = self._create_caver_config(output_subdir, start_atoms, probe_radius)
 
             cmd = [
                 "java", "-jar", str(caver_jar),
                 "-home", str(caver_jar.parent),
-                "-pdb", str(temp_pdb_dir),
+                "-pdb", str(pdb),
                 "-conf", str(config_file),
-                "-out", str(output_subdir)
+                "-out", str(output_subdir),
             ]
 
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
-                if result.returncode == 0:
-                    print("   ✓ CAVER completed")
-                    tunnel_info = self._parse_caver_results(output_subdir, pdb_file.stem)
-                    results[pdb_file.stem] = tunnel_info
-                    
-                    tunnel_count = tunnel_info.get("summary", {}).get("tunnel_count", 0)
-                    print(f"      Found {tunnel_count} tunnel(s)")
-
-                else:
-                    print("   ❌ CAVER failed")
-                    print(f"      Error: {result.stderr[:200]}")
-                    results[pdb_file.stem] = {"error": result.stderr}
-
-            except subprocess.TimeoutExpired:
-                print("   ⏱ Timeout")
-                results[pdb_file.stem] = {"error": "Timeout"}
-            except Exception as e:
-                print(f"   ❌ Error: {str(e)}")
-                results[pdb_file.stem] = {"error": str(e)}
-            finally:
-                if temp_pdb_dir.exists():
-                    shutil.rmtree(temp_pdb_dir)
-
-        print("\n" + "=" * 70)
-        print("✅ CAVER tunnel detection completed!")
-        print("=" * 70)
+            if result.returncode == 0:
+                print("   ✓ CAVER finished")
+                results[pdb_name] = self._parse_caver_results(output_subdir, pdb_name)
+            else:
+                print("   ❌ CAVER error")
+                results[pdb_name] = {"error": result.stderr}
 
         return results
 
-    def _create_caver_config(self, output_dir: Path, 
-                            start_point: Optional[Tuple[float, float, float]],
-                            probe_radius: float,
-                            max_distance: float) -> Path:
+    def _create_caver_config(self, output_dir, start_atoms, probe_radius):
         config_file = output_dir / "config.txt"
-        
-        if start_point:
-            # CAVER 3.0正确的配置格式
-            config_content = f"""# CAVER 3.0 Configuration
-# Starting point from P2Rank top pocket
 
-# Starting point (single line with 3 coordinates)
-origin {start_point[0]:.3f} {start_point[1]:.3f} {start_point[2]:.3f}
+        txt = "# CAVER config\n"
+        for atom in start_atoms:
+            txt += f"starting_point_atom {atom}\n"
 
-# Calculation parameters
-bottleneck_radius {probe_radius}
-bottleneck_length 3
-shell_depth 4
-shell_radius 3
-
-# Clustering and filtering
-desired_radius 1.4
-max_tunnel_similarity 0.7
-clustering_threshold 3.5
-
-# Output
-tunnels_directory tunnels
+        txt += f"""
+probe_radius {probe_radius}
+generate_summary yes
 """
-        else:
-            # 自动检测模式(不指定origin)
-            config_content = f"""# CAVER 3.0 Configuration
-# Auto-detection mode
 
-# Calculation parameters
-bottleneck_radius {probe_radius}
-bottleneck_length 3
-shell_depth 4
-shell_radius 3
+        with open(config_file, "w") as f:
+            f.write(txt)
 
-# Clustering and filtering
-desired_radius 1.4
-max_tunnel_similarity 0.7
-clustering_threshold 3.5
-
-# Output
-tunnels_directory tunnels
-"""
-        
-        with open(config_file, 'w') as f:
-            f.write(config_content)
-        
         return config_file
 
-    def _find_caver_jar(self) -> Optional[Path]:
-        candidates = list(self.work_dir.rglob("caver.jar"))
-        if not candidates:
-            return None
-        return candidates[0]
+    def _find_caver_jar(self):
+        jars = list(self.work_dir.rglob("caver.jar"))
+        return jars[0] if jars else None
 
-    def _get_p2rank_start_point(self, pdb_name: str) -> Optional[Tuple[float, float, float]]:
-        p2rank_dir = self.p2rank_output / pdb_name
-        csv_files = list(p2rank_dir.glob("*predictions.csv"))
-        if not csv_files:
-            return None
-
-        try:
-            df = pd.read_csv(csv_files[0], skipinitialspace=True)
-            if df.empty:
-                return None
-            
-            row = df.iloc[0]
-            x = float(row.get("center_x", 0))
-            y = float(row.get("center_y", 0))
-            z = float(row.get("center_z", 0))
-            
-            if x == 0 and y == 0 and z == 0:
-                return None
-
-            return (x, y, z)
-        except Exception as e:
-            print(f"      ⚠️ Failed to get start point: {e}")
-            return None
-
-    def _parse_caver_results(self, output_dir: Path, pdb_name: str) -> Dict:
-        tunnel_files = []
-        
-        tunnel_files.extend(list(output_dir.glob("tunnel_*.pdb")))
-        tunnel_files.extend(list(output_dir.glob("tunnel*.pdb")))
-        
-        tunnels_dir = output_dir / "tunnels"
-        if tunnels_dir.exists():
-            tunnel_files.extend(list(tunnels_dir.glob("tunnel_*.pdb")))
-            tunnel_files.extend(list(tunnels_dir.glob("tunnel*.pdb")))
-
-        tunnel_files = list(set(tunnel_files))
-
+    def _parse_caver_results(self, output_dir, pdb_name):
+        tunnel_files = list(output_dir.rglob("tunnel*.pdb"))
         return {
             "pdb_name": pdb_name,
             "summary": {
@@ -486,79 +321,21 @@ tunnels_directory tunnels
             "tunnels": [{"id": f.stem, "file": str(f)} for f in tunnel_files]
         }
 
-    def generate_summary_report(self, p2rank_results: Dict, caver_results: Dict) -> pd.DataFrame:
-        print("\n📋 Generating Summary Report...")
-
-        report = []
-        proteins = sorted(set(p2rank_results.keys()) | set(caver_results.keys()))
-
-        for p in proteins:
-            r1 = p2rank_results.get(p, {})
-            r2 = caver_results.get(p, {})
-
-            top_score = 0.0
-            top_prob = 0.0
-            top_center_x = 0.0
-            top_center_y = 0.0
-            top_center_z = 0.0
-            quality = "unknown"
-            warnings_str = ""
-            
-            if r1.get("pockets"):
-                top = r1["pockets"][0]
-                top_score = top.get("score", 0.0)
-                top_prob = top.get("probability", 0.0)
-                top_center_x = top.get("center_x", 0.0)
-                top_center_y = top.get("center_y", 0.0)
-                top_center_z = top.get("center_z", 0.0)
-            
-            if r1.get("validation"):
-                quality = r1["validation"].get("quality", "unknown")
-                warnings = r1["validation"].get("warnings", [])
-                warnings_str = "; ".join(warnings[:3])
-
-            row = {
-                "Protein": p,
-                "Total_Pockets": r1.get("summary", {}).get("total_pockets", 0),
-                "Top_Pocket_Score": top_score,
-                "Top_Pocket_Probability": top_prob,
-                "Pocket_Center_X": top_center_x,
-                "Pocket_Center_Y": top_center_y,
-                "Pocket_Center_Z": top_center_z,
-                "Tunnel_Count": r2.get("summary", {}).get("tunnel_count", 0),
-                "P2Rank_Status": "Success" if "error" not in r1 and "parse_error" not in r1 else "Failed",
-                "CAVER_Status": "Success" if "error" not in r2 else "Failed",
-                "Quality": quality,
-                "Warnings": warnings_str
-            }
-            report.append(row)
-
-        df = pd.DataFrame(report)
-        df.to_csv(self.output_dir / "summary_report.csv", index=False)
-
-        print("✅ Summary saved")
-        return df
-
-    def save_detailed_results(self, p2rank_results: Dict, caver_results: Dict):
-        data = {"p2rank": p2rank_results, "caver": caver_results}
-        with open(self.output_dir / "detailed_results.json", "w") as f:
-            json.dump(data, f, indent=2)
-        print("📄 Detailed results saved")
-
-
 def main():
     analyzer = ProteinAnalyzer()
     
     analyzer.setup_environment()
     
     p2rank_results = analyzer.run_p2rank()
-    caver_results = analyzer.run_caver(use_p2rank_pockets=True)
+    
+    caver_results = analyzer.run_caver(
+        use_p2rank_pockets=True,
+        atom_id_strategy="use_residue_ids"
+    )
 
-    df = analyzer.generate_summary_report(p2rank_results, caver_results)
-    analyzer.save_detailed_results(p2rank_results, caver_results)
-
-    return analyzer, df
+    print("\n🎉 All processing finished.")
+    return analyzer, p2rank_results, caver_results
 
 
 if __name__ == "__main__":
-    analyzer, summary = main()
+    analyzer, p2, cav = main()
