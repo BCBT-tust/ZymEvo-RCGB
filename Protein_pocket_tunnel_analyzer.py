@@ -13,23 +13,16 @@ import re
 class ProteinAnalyzer:
     
     def __init__(self, work_dir: str = "/content/protein_analysis"):
-        """
-        初始化分析器
-        
-        Args:
-            work_dir: 工作目录路径
-        """
+
         self.work_dir = Path(work_dir)
         self.input_dir = self.work_dir / "input"
         self.output_dir = self.work_dir / "output"
         self.p2rank_output = self.output_dir / "p2rank"
         self.caver_output = self.output_dir / "caver"
-        
-        # 工具路径
+
         self.p2rank_path = self.work_dir / "p2rank_2.4.2"
         self.caver_path = self.work_dir / "caver_3.02"
-        
-        # 创建目录
+
         self._create_directories()
         
     def _create_directories(self):
