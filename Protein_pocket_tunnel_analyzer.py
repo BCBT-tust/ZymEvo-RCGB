@@ -107,7 +107,8 @@ class ProteinAnalyzer:
         
         # CAVER 3.02下载链接
         caver_url = "http://www.caver.cz/download/caver_3.02.tar.gz"
-
+        
+        try:
             subprocess.run(
                 ["wget", "-q", "-O", f"{self.work_dir}/caver.tar.gz", caver_url],
                 check=True,
