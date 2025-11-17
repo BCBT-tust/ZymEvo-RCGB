@@ -56,29 +56,38 @@ class ProteinAnalyzer:
         print("✅ Java installed successfully")
     
     def _download_p2rank(self):
-        print("\n📦 Downloading P2Rank v2.4.2...")
-        
+        print("\n📦 Downloading P2Rank v2.4.2 (mirror)...")
+    
         if self.p2rank_path.exists():
             print("✅ P2Rank already exists")
             return
-        
-        p2rank_url = "https://github.com/rdk/p2rank/releases/download/2.4.2/p2rank_2.4.2.tar.gz"
-        
+        p2rank_url = (
+            "https://ghproxy.com/https://github.com/rdk/p2rank/releases/download/2.4.2/"
+            "p2rank_2.4.2.tar.gz"
+        )
+    
+        tar_path = f"{self.work_dir}/p2rank.tar.gz"
+    
         try:
+            print("⏳ Downloading from accelerated mirror...")
             subprocess.run(
-                ["wget", "-q", "-O", f"{self.work_dir}/p2rank.tar.gz", p2rank_url],
+                ["wget", "-O", tar_path, p2rank_url],
                 check=True,
-                timeout=120
+                timeout=600 
             )
-
+    
+            if os.path.getsize(tar_path) < 100_000_000:
+                raise Exception("Downloaded P2Rank is too small — mirror failed or corrupted.")
+    
+            print("📦 Extracting P2Rank...")
             subprocess.run(
-                ["tar", "-xzf", f"{self.work_dir}/p2rank.tar.gz", "-C", str(self.work_dir)],
+                ["tar", "-xzf", tar_path, "-C", str(self.work_dir)],
                 check=True
             )
-
-            os.remove(f"{self.work_dir}/p2rank.tar.gz")
-            print("✅ P2Rank downloaded and extracted")
-            
+    
+            os.remove(tar_path)
+            print("✅ P2Rank downloaded & extracted successfully")
+    
         except Exception as e:
             print(f"❌ Failed to download P2Rank: {e}")
             raise
