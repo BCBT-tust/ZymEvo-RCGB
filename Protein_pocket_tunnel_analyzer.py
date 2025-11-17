@@ -62,8 +62,7 @@ class ProteinAnalyzer:
             print("✅ P2Rank already exists")
             return
         p2rank_url = (
-            "https://ghproxy.com/https://github.com/rdk/p2rank/releases/download/2.4.2/"
-            "p2rank_2.4.2.tar.gz"
+            "https://ghproxy.com/https://github.com/rdk/p2rank/releases/download/2.4.2/p2rank_2.4.2.tar.gz"
         )
     
         tar_path = f"{self.work_dir}/p2rank.tar.gz"
