@@ -11,7 +11,6 @@ import re
 
 
 class ProteinAnalyzer:
-    
     def __init__(self, work_dir: str = "/content/protein_analysis"):
 
         self.work_dir = Path(work_dir)
