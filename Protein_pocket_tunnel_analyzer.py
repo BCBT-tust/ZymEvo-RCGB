@@ -106,36 +106,46 @@ class ProteinAnalyzer:
             return
         
         # CAVER 3.02下载链接
-        caver_url = "http://www.caver.cz/download/caver_3.02.tar.gz"
-        
+        caver_url = "https://www.caver.cz/fil/download/caver30/302/caver_3.0.2.zip"
+    
+        zip_path = f"{self.work_dir}/caver.zip"
+    
         try:
+            # 下载 ZIP 文件
             subprocess.run(
-                ["wget", "-q", "-O", f"{self.work_dir}/caver.tar.gz", caver_url],
+                ["wget", "-q", "-O", zip_path, caver_url],
                 check=True,
                 timeout=120
             )
             
+            # 检查文件是否有效
+            if os.path.getsize(zip_path) < 100000:  # <100 KB 一定是坏文件（HTML）
+                raise Exception("Downloaded CAVER file is too small — likely HTML error page.")
+            
+            # 解压 ZIP
             subprocess.run(
-                ["tar", "-xzf", f"{self.work_dir}/caver.tar.gz", "-C", str(self.work_dir)],
+                ["unzip", "-o", zip_path, "-d", str(self.work_dir)],
                 check=True
             )
             
-            os.remove(f"{self.work_dir}/caver.tar.gz")
-
+            # 删除 ZIP
+            os.remove(zip_path)
+            
+            # 检查 caver.jar 是否存在
             caver_jar = self.caver_path / "caver.jar"
             if not caver_jar.exists():
-                # 尝试查找JAR文件
                 jar_files = list(self.caver_path.rglob("*.jar"))
                 if jar_files:
-                    print(f"   Found CAVER JAR: {jar_files[0].name}")
+                    print(f"   Found CAVER jar: {jar_files[0]}")
                 else:
-                    raise FileNotFoundError("CAVER JAR not found")
-            
-            print("✅ CAVER 3.0 downloaded and extracted")
-            
+                    raise FileNotFoundError("CAVER jar not found after extraction")
+    
+            print("✅ CAVER 3.0.2 downloaded and extracted successfully")
+    
         except Exception as e:
-            print(f"❌ Failed to download CAVER: {e}")
+            print(f"❌ Failed to download or extract CAVER: {e}")
             raise
+
     
     def run_p2rank(self, pdb_files: List[str] = None,
                    min_score: float = 0.0,
