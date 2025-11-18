@@ -261,7 +261,6 @@ class ProteinAnalyzer:
                 print("   ⚠️ No residue_ids in P2Rank output")
                 return None
 
-            # A_103 A_231 A_235 ...
             residues = []
             for item in residues_str.split():
                 if "_" in item:
@@ -325,16 +324,44 @@ class ProteinAnalyzer:
             print("❌ caver.jar not found")
             return {}
 
+        import re
+        pdb_groups = {}
+        
+        for pdb in pdb_files:
+            match = re.match(r'^(.+?)(\d+)?$', pdb.stem)
+            if match:
+                prefix = match.group(1)
+            else:
+                prefix = pdb.stem
+            
+            if prefix not in pdb_groups:
+                pdb_groups[prefix] = []
+            pdb_groups[prefix].append(pdb)
+        
+        print(f"\n📊 Detected {len(pdb_groups)} protein group(s):")
+        for prefix, files in pdb_groups.items():
+            print(f"   • {prefix}: {len(files)} frame(s)")
+
         results: Dict[str, Dict] = {}
 
-        for i, pdb in enumerate(pdb_files, 1):
-            pdb_name = pdb.stem
-            print(f"\n[{i}/{len(pdb_files)}] 🌀 CAVER for {pdb.name}")
+        for group_idx, (protein_name, group_pdbs) in enumerate(pdb_groups.items(), 1):
+            print(f"\n[{group_idx}/{len(pdb_groups)}] 🌀 CAVER for {protein_name} ({len(group_pdbs)} frame(s))")
 
-            output_subdir = self.caver_output / pdb_name
+            output_subdir = self.caver_output / protein_name
             output_subdir.mkdir(parents=True, exist_ok=True)
 
-            start_atoms = self._get_atoms_from_residue_ids(pdb, pdb_name)
+            temp_pdb_dir = output_subdir / "temp_input"
+            temp_pdb_dir.mkdir(exist_ok=True)
+
+            import shutil
+            for pdb in group_pdbs:
+                temp_pdb_file = temp_pdb_dir / pdb.name
+                shutil.copy(str(pdb), str(temp_pdb_file))
+            
+            print(f"   ✓ Prepared {len(group_pdbs)} PDB file(s) in: {temp_pdb_dir}")
+
+            representative_pdb = group_pdbs[0]
+            start_atoms = self._get_atoms_from_residue_ids(representative_pdb, protein_name)
             if not start_atoms:
                 print("   ⚠️ No residue-based start atoms, fallback to atom 1")
                 start_atoms = [1]
@@ -342,14 +369,15 @@ class ProteinAnalyzer:
             config_file = self._create_full_caver_config(
                 output_subdir,
                 start_atoms=start_atoms,
-                probe_radius=probe_radius
+                probe_radius=probe_radius,
+                num_frames=len(group_pdbs)  # ✅ New parameter
             )
             print(f"   📝 CAVER config: {config_file}")
 
             cmd = [
                 "java", "-jar", str(caver_jar),
                 "-home", str(caver_jar.parent),
-                "-pdb", str(pdb.parent),  # ⚠ FIX: must be directory, not file
+                "-pdb", str(temp_pdb_dir),  # ✅ Directory containing all frames
                 "-conf", str(config_file),
                 "-out", str(output_subdir),
             ]
@@ -363,20 +391,25 @@ class ProteinAnalyzer:
                 )
                 if result.returncode == 0:
                     print("   ✓ CAVER finished")
-                    results[pdb_name] = self._parse_caver_results(output_subdir, pdb_name)
-                    tc = results[pdb_name]["summary"]["tunnel_count"]
+                    results[protein_name] = self._parse_caver_results(output_subdir, protein_name)
+                    tc = results[protein_name]["summary"]["tunnel_count"]
                     print(f"   ✓ Tunnels found: {tc}")
                 else:
                     print("   ❌ CAVER error")
                     print(result.stderr[:200])
-                    results[pdb_name] = {"error": result.stderr}
+                    results[protein_name] = {"error": result.stderr}
 
             except subprocess.TimeoutExpired:
                 print("   ⏱️ CAVER timeout")
-                results[pdb_name] = {"error": "Timeout"}
+                results[protein_name] = {"error": "Timeout"}
             except Exception as e:
                 print(f"   ❌ CAVER exception: {e}")
-                results[pdb_name] = {"error": str(e)}
+                results[protein_name] = {"error": str(e)}
+            finally:
+                # Clean up temporary PDB directory
+                if temp_pdb_dir.exists():
+                    import shutil
+                    shutil.rmtree(temp_pdb_dir, ignore_errors=True)
 
         print("\n" + "=" * 70)
         print("✅ CAVER analysis completed!")
@@ -386,7 +419,8 @@ class ProteinAnalyzer:
 
     def _create_full_caver_config(self, output_dir: Path,
                                   start_atoms: List[int],
-                                  probe_radius: float = 0.9) -> Path:
+                                  probe_radius: float = 0.9,
+                                  num_frames: int = 1) -> Path:
         config_file = output_dir / "config.txt"
 
         txt = """#*****************************
@@ -399,9 +433,12 @@ load_cluster_tree no
 # INPUT DATA
 #*****************************
 time_sparsity 1
-first_frame 1
-last_frame 1 #如果有MD多个pdb文件，可以修改为10
-
+first_frame 1 #如果有多个MD轨迹文件pdb文件，可修改为10
+"""
+        # Set last_frame based on number of PDB files
+        txt += f"last_frame {num_frames}\n"
+        
+        txt += """
 #*****************************
 # TUNNEL CALCULATION
 #*****************************
@@ -488,7 +525,6 @@ seed 1
         csv_path = output_dir / "analysis" / "tunnel_characteristics.csv"
         
         if not csv_path.exists():
-            # Fallback: search for tunnel PDB files
             tunnel_files = []
             for pattern in ["tunnel_*.pdb", "tunnel*.pdb"]:
                 tunnel_files.extend(list(output_dir.glob(pattern)))
@@ -502,6 +538,8 @@ seed 1
             return result
         
         try:
+            # CAVER may use comma or tab separator
+            # Try both with proper space handling
             df = None
             for sep in [',', '\t']:
                 try:
@@ -520,7 +558,7 @@ seed 1
             
             result["summary"]["tunnel_count"] = len(df)
             result["summary"]["csv_file"] = str(csv_path)
-            
+
             for idx, row in df.iterrows():
                 try:
                     tunnel_data = {
