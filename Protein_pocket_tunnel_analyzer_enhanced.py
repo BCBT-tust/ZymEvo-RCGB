@@ -99,9 +99,8 @@ class ProteinAnalyzer:
             self.caver_path = existing[0].parent
             print(f"✅ CAVER already exists at: {self.caver_path}")
             return
-
-        # Use direct download from sourceforge mirror
-        url = "https://master.dl.sourceforge.net/project/caver/CAVER%203.0/CAVER3.0_java.zip"
+            
+        url = "https://www.caver.cz/fil/download/caver30/302/caver_3.0.2.zip"
         zip_path = self.work_dir / "caver.zip"
 
         try:
