@@ -349,7 +349,7 @@ class ProteinAnalyzer:
             cmd = [
                 "java", "-jar", str(caver_jar),
                 "-home", str(caver_jar.parent),
-                "-pdb", str(pdb.parent),  # ⚠ FIX: must be directory, not file
+                "-pdb", str(pdb.parent),  
                 "-conf", str(config_file),
                 "-out", str(output_subdir),
             ]
@@ -479,22 +479,61 @@ seed 1
         return jars[0] if jars else None
 
     def _parse_caver_results(self, output_dir: Path, pdb_name: str) -> Dict:
-        tunnel_files = []
-        for pattern in ["tunnel_*.pdb", "tunnel*.pdb"]:
-            tunnel_files.extend(list(output_dir.glob(pattern)))
-            data_dir = output_dir / "data"
-            if data_dir.exists():
-                tunnel_files.extend(list(data_dir.glob(pattern)))
-
-        tunnel_files = list(set(tunnel_files))
-        return {
+        result = {
             "pdb_name": pdb_name,
-            "summary": {
-                "tunnel_count": len(tunnel_files),
-                "files": [str(f) for f in tunnel_files]
-            },
-            "tunnels": [{"id": f.stem, "file": str(f)} for f in tunnel_files]
+            "summary": {"tunnel_count": 0},
+            "tunnels": []
         }
+        
+        csv_path = output_dir / "analysis" / "tunnel_characteristics.csv"
+        
+        if not csv_path.exists():
+            # Fallback: search for tunnel PDB files
+            tunnel_files = []
+            for pattern in ["tunnel_*.pdb", "tunnel*.pdb"]:
+                tunnel_files.extend(list(output_dir.glob(pattern)))
+                data_dir = output_dir / "data"
+                if data_dir.exists():
+                    tunnel_files.extend(list(data_dir.glob(pattern)))
+            
+            tunnel_files = list(set(tunnel_files))
+            result["summary"]["tunnel_count"] = len(tunnel_files)
+            result["tunnels"] = [{"id": f.stem, "file": str(f)} for f in tunnel_files]
+            return result
+        
+        try:
+            df = pd.read_csv(csv_path, sep='\t', skipinitialspace=True)
+            
+            # Clean column names (remove leading/trailing spaces)
+            df.columns = df.columns.str.strip()
+            
+            result["summary"]["tunnel_count"] = len(df)
+            result["summary"]["csv_file"] = str(csv_path)
+            
+            # Extract tunnel details
+            for idx, row in df.iterrows():
+                tunnel_data = {
+                    "cluster": int(row.get("Tunnel cluster", 0)),
+                    "tunnel_id": int(row.get("Tunnel", 0)),
+                    "throughput": float(row.get("Throughput", 0.0)),
+                    "bottleneck_radius": float(row.get("Bottleneck radius", 0.0)),
+                    "length": float(row.get("Length", 0.0)),
+                    "curvature": float(row.get("Curvature", 0.0)),
+                    "cost": float(row.get("Cost", 0.0))
+                }
+                result["tunnels"].append(tunnel_data)
+            
+            if len(df) > 0:
+                result["summary"]["avg_throughput"] = float(df["Throughput"].mean())
+                result["summary"]["avg_bottleneck"] = float(df["Bottleneck radius"].mean())
+                result["summary"]["avg_length"] = float(df["Length"].mean())
+                result["summary"]["avg_curvature"] = float(df["Curvature"].mean())
+                
+        except Exception as e:
+            print(f"      ⚠️ Failed to parse tunnel_characteristics.csv: {e}")
+            result["parse_error"] = str(e)
+        
+        return result
 
     def generate_summary_report(self, p2rank_results: Dict, caver_results: Dict) -> pd.DataFrame:
         print("\n📋 Generating Summary Report...")
@@ -519,6 +558,10 @@ seed 1
                 "Top_Pocket_Score": top_score,
                 "Top_Pocket_Probability": top_prob,
                 "Tunnel_Count": r2.get("summary", {}).get("tunnel_count", 0),
+                "Avg_Throughput": round(r2.get("summary", {}).get("avg_throughput", 0.0), 3),
+                "Avg_Bottleneck_Radius": round(r2.get("summary", {}).get("avg_bottleneck", 0.0), 3),
+                "Avg_Length": round(r2.get("summary", {}).get("avg_length", 0.0), 2),
+                "Avg_Curvature": round(r2.get("summary", {}).get("avg_curvature", 0.0), 3),
                 "P2Rank_Status": "Success" if "error" not in r1 else "Failed",
                 "CAVER_Status": "Success" if "error" not in r2 else "Failed",
             }
@@ -536,6 +579,34 @@ seed 1
         with open(json_path, "w") as f:
             json.dump(data, f, indent=2)
         print(f"📄 Detailed results saved to: {json_path}")
+        
+        self._save_tunnel_details_csv(caver_results)
+    
+    def _save_tunnel_details_csv(self, caver_results: Dict):
+        tunnel_rows = []
+        
+        for protein_name, result in caver_results.items():
+            if "error" in result or not result.get("tunnels"):
+                continue
+            
+            for tunnel in result["tunnels"]:
+                row = {
+                    "Protein": protein_name,
+                    "Cluster": tunnel.get("cluster", ""),
+                    "Tunnel_ID": tunnel.get("tunnel_id", ""),
+                    "Throughput": tunnel.get("throughput", 0.0),
+                    "Bottleneck_Radius": tunnel.get("bottleneck_radius", 0.0),
+                    "Length": tunnel.get("length", 0.0),
+                    "Curvature": tunnel.get("curvature", 0.0),
+                    "Cost": tunnel.get("cost", 0.0)
+                }
+                tunnel_rows.append(row)
+        
+        if tunnel_rows:
+            df = pd.DataFrame(tunnel_rows)
+            csv_path = self.output_dir / "tunnel_details.csv"
+            df.to_csv(csv_path, index=False)
+            print(f"📊 Tunnel details saved to: {csv_path}")
 
 def main():
     analyzer = ProteinAnalyzer()
