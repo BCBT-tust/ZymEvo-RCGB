@@ -349,7 +349,7 @@ class ProteinAnalyzer:
             cmd = [
                 "java", "-jar", str(caver_jar),
                 "-home", str(caver_jar.parent),
-                "-pdb", str(pdb.parent),  
+                "-pdb", str(pdb.parent),  # ⚠ FIX: must be directory, not file
                 "-conf", str(config_file),
                 "-out", str(output_subdir),
             ]
@@ -502,35 +502,58 @@ seed 1
             return result
         
         try:
-            df = pd.read_csv(csv_path, sep='\t', skipinitialspace=True)
+            df = None
+            for sep in [',', '\t']:
+                try:
+                    df = pd.read_csv(csv_path, sep=sep, skipinitialspace=True)
+                    # Validate: should have multiple columns
+                    if len(df.columns) > 5:
+                        break
+                except:
+                    continue
             
-            # Clean column names (remove leading/trailing spaces)
+            if df is None or len(df) == 0:
+                print(f"      ⚠️ Could not parse CSV with comma or tab separator")
+                return result
+            
             df.columns = df.columns.str.strip()
             
             result["summary"]["tunnel_count"] = len(df)
             result["summary"]["csv_file"] = str(csv_path)
             
-            # Extract tunnel details
             for idx, row in df.iterrows():
-                tunnel_data = {
-                    "cluster": int(row.get("Tunnel cluster", 0)),
-                    "tunnel_id": int(row.get("Tunnel", 0)),
-                    "throughput": float(row.get("Throughput", 0.0)),
-                    "bottleneck_radius": float(row.get("Bottleneck radius", 0.0)),
-                    "length": float(row.get("Length", 0.0)),
-                    "curvature": float(row.get("Curvature", 0.0)),
-                    "cost": float(row.get("Cost", 0.0))
-                }
-                result["tunnels"].append(tunnel_data)
+                try:
+                    tunnel_data = {
+                        "cluster": int(row["Tunnel cluster"]) if "Tunnel cluster" in df.columns else idx+1,
+                        "tunnel_id": int(row["Tunnel"]) if "Tunnel" in df.columns else idx+1,
+                        "throughput": float(row["Throughput"]) if "Throughput" in df.columns else 0.0,
+                        "bottleneck_radius": float(row["Bottleneck radius"]) if "Bottleneck radius" in df.columns else 0.0,
+                        "length": float(row["Length"]) if "Length" in df.columns else 0.0,
+                        "curvature": float(row["Curvature"]) if "Curvature" in df.columns else 0.0,
+                        "cost": float(row["Cost"]) if "Cost" in df.columns else 0.0
+                    }
+                    result["tunnels"].append(tunnel_data)
+                except (KeyError, ValueError) as e:
+                    print(f"      ⚠️ Skipping row {idx}: {e}")
+                    continue
             
-            if len(df) > 0:
-                result["summary"]["avg_throughput"] = float(df["Throughput"].mean())
-                result["summary"]["avg_bottleneck"] = float(df["Bottleneck radius"].mean())
-                result["summary"]["avg_length"] = float(df["Length"].mean())
-                result["summary"]["avg_curvature"] = float(df["Curvature"].mean())
+            if len(df) > 0 and len(result["tunnels"]) > 0:
+                try:
+                    if "Throughput" in df.columns:
+                        result["summary"]["avg_throughput"] = float(df["Throughput"].mean())
+                    if "Bottleneck radius" in df.columns:
+                        result["summary"]["avg_bottleneck"] = float(df["Bottleneck radius"].mean())
+                    if "Length" in df.columns:
+                        result["summary"]["avg_length"] = float(df["Length"].mean())
+                    if "Curvature" in df.columns:
+                        result["summary"]["avg_curvature"] = float(df["Curvature"].mean())
+                except Exception as stat_err:
+                    print(f"      ⚠️ Statistics calculation failed: {stat_err}")
                 
         except Exception as e:
             print(f"      ⚠️ Failed to parse tunnel_characteristics.csv: {e}")
+            import traceback
+            print(f"      → Traceback: {traceback.format_exc()}")
             result["parse_error"] = str(e)
         
         return result
