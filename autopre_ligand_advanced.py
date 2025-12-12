@@ -789,6 +789,22 @@ class LigandOptimizer:
         if self.verbose:
             print(f"      Chemical constraints: {len(chemical_frozen)} bonds")
             print(f"      Flexible bonds: {len(flexible_branches)} bonds")
+            print(f"      DEBUG: Total scored branches = {len(scored_branches)}")
+            
+            # Print distribution
+            if len(chemical_frozen) > 0:
+                print(f"      DEBUG: Chemical frozen reasons:")
+                reason_counts = {}
+                for b in chemical_frozen[:5]:  # Show first 5
+                    reason = b.freeze_reason if b.freeze_reason else "Unknown"
+                    reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                    print(f"        Branch {b.branch_id}: {reason} (score={b.priority_score})")
+                if len(chemical_frozen) > 5:
+                    print(f"        ... and {len(chemical_frozen) - 5} more")
+                    
+            if len(flexible_branches) > 0:
+                print(f"      DEBUG: Flexible branches score range: "
+                      f"{flexible_branches[-1].priority_score} to {flexible_branches[0].priority_score}")
         
         # Step 4: Smart freeze decision - IMPROVED
         if self.verbose:
@@ -802,6 +818,11 @@ class LigandOptimizer:
         n_chemical_frozen = len(chemical_frozen)
         n_flexible_available = len(flexible_branches)
         
+        if self.verbose:
+            print(f"      DEBUG: n_to_freeze_total = {original_torsdof} - {target_torsdof} = {n_to_freeze_total}")
+            print(f"      DEBUG: n_chemical_frozen = {n_chemical_frozen}")
+            print(f"      DEBUG: n_flexible_available = {n_flexible_available}")
+        
         # Calculate minimum flexible bonds to keep
         min_keep = max(
             self.MIN_FLEXIBLE_BONDS,
@@ -814,6 +835,13 @@ class LigandOptimizer:
         # How many flexible bonds we actually need to freeze
         n_flexible_to_freeze = n_to_freeze_total - n_chemical_frozen
         
+        if self.verbose:
+            print(f"      需要冻结总数: {n_to_freeze_total}")
+            print(f"      化学约束已冻结: {n_chemical_frozen}")
+            print(f"      需要从柔性中冻结: {n_flexible_to_freeze}")
+            print(f"      柔性分支最少保留: {min_keep} ({int(self.MIN_FLEXIBLE_RATIO*100)}% 规则)")
+            print(f"      最多可冻结柔性: {max_freezable}")
+            
         # Adjust if we can't reach target
         if n_flexible_to_freeze > max_freezable:
             warnings.append(
@@ -828,11 +856,21 @@ class LigandOptimizer:
             recommendations.append(
                 f"Recommended target for this ligand: {final_torsdof} (preserves key flexibility)"
             )
+            
+            if self.verbose:
+                print(f"      ⚠️  无法达到目标 {target_torsdof}，实际将达到 {final_torsdof}")
         
         # Select branches to freeze
         if n_flexible_to_freeze > 0:
             branches_to_freeze = flexible_branches[-n_flexible_to_freeze:]
             branches_to_keep = flexible_branches[:-n_flexible_to_freeze]
+            
+            if self.verbose:
+                print(f"      DEBUG: 切片逻辑:")
+                print(f"        flexible_branches总数: {len(flexible_branches)}")
+                print(f"        取最后{n_flexible_to_freeze}个作为to_freeze")
+                print(f"        branches_to_freeze数量: {len(branches_to_freeze)}")
+                print(f"        branches_to_keep数量: {len(branches_to_keep)}")
         else:
             branches_to_freeze = []
             branches_to_keep = flexible_branches
