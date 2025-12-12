@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
+AutoPre Ligand Advanced - Intelligent Ligand Flexibility Optimizer (FIXED VERSION)
 Automatically reduces ligand rotatable bonds (TORSDOF) while preserving chemical validity
+Author: ZymEvo Development Team
+Version: 2.0 (Bug fixes + Better logic)
 """
 
 import os
@@ -951,51 +954,86 @@ class LigandOptimizer:
                            pdbqt_file: str,
                            branches_to_freeze: List[BranchInfo],
                            output_file: str) -> int:
-
+        """
+        Freeze branches by removing their BRANCH/ENDBRANCH blocks
+        FIXED: Use line numbers instead of sequential counter
+        """
         with open(pdbqt_file, 'r') as f:
             lines = f.readlines()
         
-        # Get branch IDs to freeze
-        freeze_ids = {b.branch_id for b in branches_to_freeze}
+        # Build set of line ranges to skip (line_start to line_end inclusive)
+        freeze_ranges = []
+        for branch in branches_to_freeze:
+            freeze_ranges.append((branch.line_start, branch.line_end))
         
         if self.verbose:
-            print(f"      DEBUG: Freezing branch IDs: {sorted(freeze_ids)}")
-            print(f"      DEBUG: Total branches to freeze: {len(freeze_ids)}")
+            print(f"      DEBUG: Freezing {len(freeze_ranges)} branches at line ranges:")
+            for i, (start, end) in enumerate(sorted(freeze_ranges)[:5]):
+                print(f"        Branch at lines {start}-{end}")
+            if len(freeze_ranges) > 5:
+                print(f"        ... and {len(freeze_ranges) - 5} more")
         
-        # Process file
+        # Check which lines are inside freeze ranges
+        lines_to_skip = set()
+        for start, end in freeze_ranges:
+            for line_num in range(start, end + 1):
+                lines_to_skip.add(line_num)
+        
+        if self.verbose:
+            print(f"      DEBUG: Total lines to skip: {len(lines_to_skip)}")
+        
+        # Process file - skip lines in freeze ranges
         new_lines = []
-        current_branch_id = -1
-        skip_depth = 0  # How many levels deep we're skipping
-        
-        for line in lines:
-            # BRANCH line encountered
-            if line.startswith('BRANCH'):
-                current_branch_id += 1
-                
-                if current_branch_id in freeze_ids and skip_depth == 0:
-                    # Start skipping this top-level frozen branch
-                    skip_depth = 1
-                    continue
-                elif skip_depth > 0:
-                    # Nested BRANCH inside a frozen branch
-                    skip_depth += 1
-                    continue
-            
-            # ENDBRANCH line encountered
-            elif line.startswith('ENDBRANCH'):
-                if skip_depth > 0:
-                    skip_depth -= 1
-                    continue
+        for line_num, line in enumerate(lines):
+            if line_num in lines_to_skip:
+                continue
             
             # TORSDOF line - rewrite with correct count
-            elif line.startswith('TORSDOF'):
+            if line.startswith('TORSDOF'):
                 kept_branches = sum(1 for l in new_lines if l.startswith('BRANCH'))
                 new_lines.append(f"TORSDOF {kept_branches}\n")
                 continue
             
-            # Regular line
-            if skip_depth == 0:
-                new_lines.append(line)
+            new_lines.append(line)
+        
+        # Write output file
+        with open(output_file, 'w') as f:
+            f.writelines(new_lines)
+        
+        # Verify final TORSDOF
+        final_torsdof = sum(1 for l in new_lines if l.startswith('BRANCH'))
+        
+        # Verify BRANCH/ENDBRANCH balance
+        n_endbranch = sum(1 for l in new_lines if l.startswith('ENDBRANCH'))
+        
+        if self.verbose:
+            print(f"      DEBUG: Final TORSDOF in file: {final_torsdof}")
+            print(f"      DEBUG: BRANCH count: {final_torsdof}")
+            print(f"      DEBUG: ENDBRANCH count: {n_endbranch}")
+            
+            if final_torsdof != n_endbranch:
+                print(f"      ⚠️  WARNING: BRANCH/ENDBRANCH mismatch!")
+        
+        # Double-check by reading the file back
+        with open(output_file, 'r') as f:
+            verify_lines = f.readlines()
+        
+        actual_torsdof = sum(1 for l in verify_lines if l.startswith('BRANCH'))
+        declared_torsdof = None
+        
+        for line in verify_lines:
+            if line.startswith('TORSDOF'):
+                declared_torsdof = int(line.split()[1])
+                break
+        
+        if self.verbose and declared_torsdof is not None:
+            print(f"      DEBUG: Declared TORSDOF in file: {declared_torsdof}")
+            
+            if actual_torsdof != declared_torsdof:
+                print(f"      ⚠️  WARNING: TORSDOF mismatch! "
+                      f"Actual BRANCH={actual_torsdof}, Declared={declared_torsdof}")
+        
+        return actual_torsdof  # Return the actual count
         
         # Write output file
         with open(output_file, 'w') as f:
