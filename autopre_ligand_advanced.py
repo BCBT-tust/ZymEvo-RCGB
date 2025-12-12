@@ -956,84 +956,126 @@ class LigandOptimizer:
                            output_file: str) -> int:
         """
         Freeze branches by removing their BRANCH/ENDBRANCH blocks
-        FIXED: Use line numbers instead of sequential counter
+        COMPLETELY REWRITTEN: Properly handle nested branches
+        
+        Strategy:
+        1. Parse file to build branch tree structure
+        2. Only remove BRANCH/ENDBRANCH pairs that should be frozen
+        3. Keep nested branches if they should be kept, even if parent is frozen
         """
         with open(pdbqt_file, 'r') as f:
             lines = f.readlines()
         
-        # Build set of line ranges to skip (line_start to line_end inclusive)
-        freeze_ranges = []
-        for branch in branches_to_freeze:
-            freeze_ranges.append((branch.line_start, branch.line_end))
+        # Get set of branch_ids to freeze
+        freeze_ids = {b.branch_id for b in branches_to_freeze}
         
         if self.verbose:
-            print(f"      DEBUG: Freezing {len(freeze_ranges)} branches at line ranges:")
-            for i, (start, end) in enumerate(sorted(freeze_ranges)[:5]):
-                print(f"        Branch at lines {start}-{end}")
-            if len(freeze_ranges) > 5:
-                print(f"        ... and {len(freeze_ranges) - 5} more")
+            print(f"      DEBUG: Need to freeze branch IDs: {sorted(freeze_ids)}")
         
-        # Check which lines are inside freeze ranges
-        lines_to_skip = set()
-        for start, end in freeze_ranges:
-            for line_num in range(start, end + 1):
-                lines_to_skip.add(line_num)
+        # Parse complete branch structure with tracking
+        branch_stack = []
+        branch_map = {}  # branch_id -> (start_line, end_line, depth)
+        current_id = -1
         
-        if self.verbose:
-            print(f"      DEBUG: Total lines to skip: {len(lines_to_skip)}")
-        
-        # Process file - skip lines in freeze ranges
-        new_lines = []
         for line_num, line in enumerate(lines):
-            if line_num in lines_to_skip:
-                continue
+            if line.startswith('BRANCH'):
+                current_id += 1
+                branch_stack.append({
+                    'id': current_id,
+                    'start': line_num,
+                    'depth': len(branch_stack)
+                })
+            elif line.startswith('ENDBRANCH'):
+                if branch_stack:
+                    branch = branch_stack.pop()
+                    branch_map[branch['id']] = (branch['start'], line_num, branch['depth'])
+        
+        if self.verbose:
+            print(f"      DEBUG: Total branches in file: {len(branch_map)}")
+            print(f"      DEBUG: Branches to freeze: {len(freeze_ids)}")
+        
+        # Identify which BRANCH/ENDBRANCH pairs to remove
+        # Only remove if:
+        # 1. The branch is in freeze_ids
+        # 2. It's not nested inside a branch we're keeping
+        lines_to_remove = set()
+        
+        for branch_id in freeze_ids:
+            if branch_id in branch_map:
+                start, end, depth = branch_map[branch_id]
+                
+                # Check if any parent branch (at lower depth) is being kept
+                parent_kept = False
+                for other_id in range(branch_id):
+                    if other_id not in freeze_ids and other_id in branch_map:
+                        other_start, other_end, other_depth = branch_map[other_id]
+                        # If this branch is nested inside a kept branch
+                        if other_depth < depth and other_start < start < other_end:
+                            parent_kept = True
+                            break
+                
+                if not parent_kept:
+                    # Mark ONLY the BRANCH and ENDBRANCH lines for removal
+                    lines_to_remove.add(start)  # BRANCH line
+                    lines_to_remove.add(end)    # ENDBRANCH line
+        
+        if self.verbose:
+            print(f"      DEBUG: BRANCH/ENDBRANCH lines to remove: {len(lines_to_remove)}")
+        
+        # Build output - remove marked lines
+        new_lines = []
+        skip_depth = 0
+        branch_counter = -1
+        
+        for line_num, line in enumerate(lines):
+            # Track current branch for skip logic
+            if line.startswith('BRANCH'):
+                branch_counter += 1
+                
+                # Should we skip this entire branch subtree?
+                if branch_counter in freeze_ids and line_num in lines_to_remove:
+                    skip_depth = 1
+                    continue
+                elif skip_depth > 0:
+                    skip_depth += 1
+                    continue
             
-            # TORSDOF line - rewrite with correct count
+            elif line.startswith('ENDBRANCH'):
+                if skip_depth > 0:
+                    skip_depth -= 1
+                    if skip_depth == 0:
+                        # Skip the ENDBRANCH of the frozen branch
+                        continue
+                elif line_num in lines_to_remove:
+                    # Orphan ENDBRANCH (shouldn't happen)
+                    continue
+            
+            # TORSDOF line - rewrite
             if line.startswith('TORSDOF'):
                 kept_branches = sum(1 for l in new_lines if l.startswith('BRANCH'))
                 new_lines.append(f"TORSDOF {kept_branches}\n")
                 continue
             
-            new_lines.append(line)
+            # Keep line if not skipping
+            if skip_depth == 0:
+                new_lines.append(line)
         
         # Write output file
         with open(output_file, 'w') as f:
             f.writelines(new_lines)
         
-        # Verify final TORSDOF
+        # Verify
         final_torsdof = sum(1 for l in new_lines if l.startswith('BRANCH'))
-        
-        # Verify BRANCH/ENDBRANCH balance
         n_endbranch = sum(1 for l in new_lines if l.startswith('ENDBRANCH'))
         
         if self.verbose:
-            print(f"      DEBUG: Final TORSDOF in file: {final_torsdof}")
-            print(f"      DEBUG: BRANCH count: {final_torsdof}")
-            print(f"      DEBUG: ENDBRANCH count: {n_endbranch}")
+            print(f"      DEBUG: Final TORSDOF: {final_torsdof}")
+            print(f"      DEBUG: BRANCH/ENDBRANCH: {final_torsdof}/{n_endbranch}")
             
             if final_torsdof != n_endbranch:
-                print(f"      ⚠️  WARNING: BRANCH/ENDBRANCH mismatch!")
+                print(f"      ⚠️  BRANCH/ENDBRANCH mismatch!")
         
-        # Double-check by reading the file back
-        with open(output_file, 'r') as f:
-            verify_lines = f.readlines()
-        
-        actual_torsdof = sum(1 for l in verify_lines if l.startswith('BRANCH'))
-        declared_torsdof = None
-        
-        for line in verify_lines:
-            if line.startswith('TORSDOF'):
-                declared_torsdof = int(line.split()[1])
-                break
-        
-        if self.verbose and declared_torsdof is not None:
-            print(f"      DEBUG: Declared TORSDOF in file: {declared_torsdof}")
-            
-            if actual_torsdof != declared_torsdof:
-                print(f"      ⚠️  WARNING: TORSDOF mismatch! "
-                      f"Actual BRANCH={actual_torsdof}, Declared={declared_torsdof}")
-        
-        return actual_torsdof  # Return the actual count
+        return final_torsdof
         
         # Write output file
         with open(output_file, 'w') as f:
