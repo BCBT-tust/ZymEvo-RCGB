@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-AutoPre Ligand Advanced - Intelligent Ligand Flexibility Optimizer (FIXED VERSION)
 Automatically reduces ligand rotatable bonds (TORSDOF) while preserving chemical validity
-Author: ZymEvo Development Team
-Version: 2.0 (Bug fixes + Better logic)
 """
 
 import os
