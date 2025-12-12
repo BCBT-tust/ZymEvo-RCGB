@@ -956,123 +956,193 @@ class LigandOptimizer:
                            output_file: str) -> int:
         """
         Freeze branches by removing their BRANCH/ENDBRANCH blocks
-        COMPLETELY REWRITTEN: Properly handle nested branches
+        FINAL FIX: Implement branch promotion for nested kept branches
         
         Strategy:
-        1. Parse file to build branch tree structure
-        2. Only remove BRANCH/ENDBRANCH pairs that should be frozen
-        3. Keep nested branches if they should be kept, even if parent is frozen
+        1. Identify branches to freeze and keep
+        2. For kept branches with frozen parents: promote them to ROOT level
+        3. Remove only the branches that should be frozen (no children kept)
         """
         with open(pdbqt_file, 'r') as f:
             lines = f.readlines()
         
-        # Get set of branch_ids to freeze
+        # Get sets of branch_ids
         freeze_ids = {b.branch_id for b in branches_to_freeze}
+        all_branch_ids = set(range(len(self.branch_analyzer.branches)))
+        keep_ids = all_branch_ids - freeze_ids
         
         if self.verbose:
-            print(f"      DEBUG: Need to freeze branch IDs: {sorted(freeze_ids)}")
+            print(f"      DEBUG: Freeze IDs: {sorted(freeze_ids)}")
+            print(f"      DEBUG: Keep IDs: {sorted(keep_ids)}")
         
-        # Parse complete branch structure with tracking
+        # Build parent-child relationships
+        parent_map = {}  # child_id -> parent_id
+        children_map = {}  # parent_id -> [child_ids]
+        
         branch_stack = []
-        branch_map = {}  # branch_id -> (start_line, end_line, depth)
         current_id = -1
         
         for line_num, line in enumerate(lines):
             if line.startswith('BRANCH'):
                 current_id += 1
-                branch_stack.append({
-                    'id': current_id,
-                    'start': line_num,
-                    'depth': len(branch_stack)
-                })
+                parent_id = branch_stack[-1] if branch_stack else None
+                parent_map[current_id] = parent_id
+                
+                if parent_id is not None:
+                    if parent_id not in children_map:
+                        children_map[parent_id] = []
+                    children_map[parent_id].append(current_id)
+                
+                branch_stack.append(current_id)
             elif line.startswith('ENDBRANCH'):
                 if branch_stack:
-                    branch = branch_stack.pop()
-                    branch_map[branch['id']] = (branch['start'], line_num, branch['depth'])
+                    branch_stack.pop()
+        
+        # Find branches that need promotion
+        # A kept branch needs promotion if ANY ancestor is frozen
+        def has_frozen_ancestor(branch_id):
+            current = parent_map.get(branch_id)
+            while current is not None:
+                if current in freeze_ids:
+                    return True
+                current = parent_map.get(current)
+            return False
+        
+        promote_ids = {bid for bid in keep_ids if has_frozen_ancestor(bid)}
         
         if self.verbose:
-            print(f"      DEBUG: Total branches in file: {len(branch_map)}")
-            print(f"      DEBUG: Branches to freeze: {len(freeze_ids)}")
+            print(f"      DEBUG: Branches needing promotion: {sorted(promote_ids)}")
         
-        # Identify which BRANCH/ENDBRANCH pairs to remove
-        # Only remove if:
-        # 1. The branch is in freeze_ids
-        # 2. It's not nested inside a branch we're keeping
-        lines_to_remove = set()
+        # Determine final action for each branch:
+        # - REMOVE: branch is frozen AND no kept descendants
+        # - PROMOTE: branch is kept but has frozen ancestor
+        # - KEEP: branch is kept and no frozen ancestor
         
-        for branch_id in freeze_ids:
-            if branch_id in branch_map:
-                start, end, depth = branch_map[branch_id]
-                
-                # Check if any parent branch (at lower depth) is being kept
-                parent_kept = False
-                for other_id in range(branch_id):
-                    if other_id not in freeze_ids and other_id in branch_map:
-                        other_start, other_end, other_depth = branch_map[other_id]
-                        # If this branch is nested inside a kept branch
-                        if other_depth < depth and other_start < start < other_end:
-                            parent_kept = True
-                            break
-                
-                if not parent_kept:
-                    # Mark ONLY the BRANCH and ENDBRANCH lines for removal
-                    lines_to_remove.add(start)  # BRANCH line
-                    lines_to_remove.add(end)    # ENDBRANCH line
+        def has_kept_descendants(branch_id):
+            """Check if this branch has any kept descendants"""
+            if branch_id in keep_ids:
+                return True
+            for child_id in children_map.get(branch_id, []):
+                if has_kept_descendants(child_id):
+                    return True
+            return False
+        
+        branches_to_remove = {
+            bid for bid in freeze_ids 
+            if not has_kept_descendants(bid)
+        }
         
         if self.verbose:
-            print(f"      DEBUG: BRANCH/ENDBRANCH lines to remove: {len(lines_to_remove)}")
+            print(f"      DEBUG: Branches to actually remove: {sorted(branches_to_remove)}")
+            print(f"      DEBUG: Branches to promote: {sorted(promote_ids)}")
         
-        # Build output - remove marked lines
+        # Process file
         new_lines = []
         skip_depth = 0
         branch_counter = -1
+        promoted_branches_content = {}  # branch_id -> lines
+        currently_promoting = None
         
         for line_num, line in enumerate(lines):
-            # Track current branch for skip logic
             if line.startswith('BRANCH'):
                 branch_counter += 1
                 
-                # Should we skip this entire branch subtree?
-                if branch_counter in freeze_ids and line_num in lines_to_remove:
+                # Should we remove this branch?
+                if branch_counter in branches_to_remove:
                     skip_depth = 1
                     continue
-                elif skip_depth > 0:
-                    skip_depth += 1
-                    continue
+                
+                # Are we inside a skip zone?
+                if skip_depth > 0:
+                    # Check if this is a branch we want to promote
+                    if branch_counter in promote_ids:
+                        currently_promoting = branch_counter
+                        promoted_branches_content[branch_counter] = []
+                        skip_depth = 0  # Stop skipping, start capturing
+                    else:
+                        skip_depth += 1
+                        continue
             
             elif line.startswith('ENDBRANCH'):
                 if skip_depth > 0:
                     skip_depth -= 1
-                    if skip_depth == 0:
-                        # Skip the ENDBRANCH of the frozen branch
-                        continue
-                elif line_num in lines_to_remove:
-                    # Orphan ENDBRANCH (shouldn't happen)
+                    continue
+                
+                # Finish promoting this branch
+                if currently_promoting is not None:
+                    # Don't add yet, will add at ROOT level later
+                    currently_promoting = None
                     continue
             
-            # TORSDOF line - rewrite
+            # TORSDOF line
             if line.startswith('TORSDOF'):
-                kept_branches = sum(1 for l in new_lines if l.startswith('BRANCH'))
-                new_lines.append(f"TORSDOF {kept_branches}\n")
+                # Will rewrite later
                 continue
             
-            # Keep line if not skipping
+            # Regular lines
             if skip_depth == 0:
-                new_lines.append(line)
+                if currently_promoting is not None:
+                    # Capture content for promoted branch
+                    promoted_branches_content[currently_promoting].append(line)
+                else:
+                    new_lines.append(line)
         
-        # Write output file
+        # Add promoted branches at ROOT level (after ROOT/ENDROOT)
+        # Find where ROOT ends
+        root_end = None
+        for i, line in enumerate(new_lines):
+            if line.startswith('ENDROOT'):
+                root_end = i
+                break
+        
+        if root_end is not None and promoted_branches_content:
+            # Insert promoted branches after ENDROOT
+            insert_pos = root_end + 1
+            for branch_id in sorted(promote_ids):
+                if branch_id in promoted_branches_content:
+                    content = promoted_branches_content[branch_id]
+                    # Wrap in BRANCH/ENDBRANCH
+                    branch_obj = self.branch_analyzer.branches[branch_id]
+                    axis = branch_obj.axis_atoms
+                    new_lines.insert(insert_pos, f"BRANCH {axis[0]:4d} {axis[1]:4d}\n")
+                    insert_pos += 1
+                    for content_line in content:
+                        new_lines.insert(insert_pos, content_line)
+                        insert_pos += 1
+                    new_lines.insert(insert_pos, f"ENDBRANCH {axis[0]:4d} {axis[1]:4d}\n")
+                    insert_pos += 1
+        
+        # Calculate and insert TORSDOF
+        final_torsdof = sum(1 for l in new_lines if l.startswith('BRANCH'))
+        
+        # Find TORSDOF line position (usually near end, before END)
+        torsdof_pos = None
+        for i in range(len(new_lines) - 1, -1, -1):
+            if new_lines[i].startswith('TORSDOF') or i == len(new_lines) - 1:
+                torsdof_pos = i
+                break
+        
+        if torsdof_pos is not None:
+            if new_lines[torsdof_pos].startswith('TORSDOF'):
+                new_lines[torsdof_pos] = f"TORSDOF {final_torsdof}\n"
+            else:
+                new_lines.insert(torsdof_pos, f"TORSDOF {final_torsdof}\n")
+        else:
+            new_lines.append(f"TORSDOF {final_torsdof}\n")
+        
+        # Write output
         with open(output_file, 'w') as f:
             f.writelines(new_lines)
         
         # Verify
-        final_torsdof = sum(1 for l in new_lines if l.startswith('BRANCH'))
+        n_branch = sum(1 for l in new_lines if l.startswith('BRANCH'))
         n_endbranch = sum(1 for l in new_lines if l.startswith('ENDBRANCH'))
         
         if self.verbose:
             print(f"      DEBUG: Final TORSDOF: {final_torsdof}")
-            print(f"      DEBUG: BRANCH/ENDBRANCH: {final_torsdof}/{n_endbranch}")
+            print(f"      DEBUG: BRANCH/ENDBRANCH: {n_branch}/{n_endbranch}")
             
-            if final_torsdof != n_endbranch:
+            if n_branch != n_endbranch:
                 print(f"      ⚠️  BRANCH/ENDBRANCH mismatch!")
         
         return final_torsdof
