@@ -913,9 +913,9 @@ class LigandOptimizer:
         return output_file, report
 
     def _freeze_branches_fixed(self, 
-                               pdbqt_file: str,
-                               branches_to_freeze: List[BranchInfo],
-                               output_file: str) -> int:
+                           pdbqt_file: str,
+                           branches_to_freeze: List[BranchInfo],
+                           output_file: str) -> int:
 
         with open(pdbqt_file, 'r') as f:
             lines = f.readlines()
@@ -925,6 +925,7 @@ class LigandOptimizer:
         
         if self.verbose:
             print(f"      DEBUG: Freezing branch IDs: {sorted(freeze_ids)}")
+            print(f"      DEBUG: Total branches to freeze: {len(freeze_ids)}")
         
         # Process file
         new_lines = []
@@ -968,10 +969,37 @@ class LigandOptimizer:
         # Verify final TORSDOF
         final_torsdof = sum(1 for l in new_lines if l.startswith('BRANCH'))
         
+        # Verify BRANCH/ENDBRANCH balance
+        n_endbranch = sum(1 for l in new_lines if l.startswith('ENDBRANCH'))
+        
         if self.verbose:
             print(f"      DEBUG: Final TORSDOF in file: {final_torsdof}")
+            print(f"      DEBUG: BRANCH count: {final_torsdof}")
+            print(f"      DEBUG: ENDBRANCH count: {n_endbranch}")
+            
+            if final_torsdof != n_endbranch:
+                print(f"      ⚠️  WARNING: BRANCH/ENDBRANCH mismatch!")
         
-        return final_torsdof
+        # Double-check by reading the file back
+        with open(output_file, 'r') as f:
+            verify_lines = f.readlines()
+        
+        actual_torsdof = sum(1 for l in verify_lines if l.startswith('BRANCH'))
+        declared_torsdof = None
+        
+        for line in verify_lines:
+            if line.startswith('TORSDOF'):
+                declared_torsdof = int(line.split()[1])
+                break
+        
+        if self.verbose and declared_torsdof is not None:
+            print(f"      DEBUG: Declared TORSDOF in file: {declared_torsdof}")
+            
+            if actual_torsdof != declared_torsdof:
+                print(f"      ⚠️  WARNING: TORSDOF mismatch! "
+                      f"Actual BRANCH={actual_torsdof}, Declared={declared_torsdof}")
+        
+        return actual_torsdof  # Return the actual count
 
     
     def _get_freeze_reason(self, branch: BranchInfo) -> str:
