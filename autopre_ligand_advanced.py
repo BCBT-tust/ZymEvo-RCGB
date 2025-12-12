@@ -911,45 +911,68 @@ class LigandOptimizer:
         )
         
         return output_file, report
-    
+
     def _freeze_branches_fixed(self, 
                                pdbqt_file: str,
                                branches_to_freeze: List[BranchInfo],
                                output_file: str) -> int:
-        """
-        COMPLETELY REWRITTEN - Properly remove BRANCH blocks
-        Returns actual final TORSDOF
-        """
+
         with open(pdbqt_file, 'r') as f:
             lines = f.readlines()
         
-        # Get line ranges to remove
-        freeze_ranges = set()
-        for branch in branches_to_freeze:
-            for line_num in range(branch.line_start, branch.line_end + 1):
-                freeze_ranges.add(line_num)
+        # Get branch IDs to freeze
+        freeze_ids = {b.branch_id for b in branches_to_freeze}
         
-        # Build new file
+        if self.verbose:
+            print(f"      DEBUG: Freezing branch IDs: {sorted(freeze_ids)}")
+        
+        # Process file
         new_lines = []
-        branches_kept = 0
+        current_branch_id = -1
+        skip_depth = 0  # How many levels deep we're skipping
         
-        for i, line in enumerate(lines):
-            if i in freeze_ranges:
-                continue  # Skip this line
-            
+        for line in lines:
+            # BRANCH line encountered
             if line.startswith('BRANCH'):
-                branches_kept += 1
-                new_lines.append(line)
+                current_branch_id += 1
+                
+                if current_branch_id in freeze_ids and skip_depth == 0:
+                    # Start skipping this top-level frozen branch
+                    skip_depth = 1
+                    continue
+                elif skip_depth > 0:
+                    # Nested BRANCH inside a frozen branch
+                    skip_depth += 1
+                    continue
+            
+            # ENDBRANCH line encountered
+            elif line.startswith('ENDBRANCH'):
+                if skip_depth > 0:
+                    skip_depth -= 1
+                    continue
+            
+            # TORSDOF line - rewrite with correct count
             elif line.startswith('TORSDOF'):
-                # Write correct TORSDOF
-                new_lines.append(f"TORSDOF {branches_kept}\n")
-            else:
+                kept_branches = sum(1 for l in new_lines if l.startswith('BRANCH'))
+                new_lines.append(f"TORSDOF {kept_branches}\n")
+                continue
+            
+            # Regular line
+            if skip_depth == 0:
                 new_lines.append(line)
         
+        # Write output file
         with open(output_file, 'w') as f:
             f.writelines(new_lines)
         
-        return branches_kept
+        # Verify final TORSDOF
+        final_torsdof = sum(1 for l in new_lines if l.startswith('BRANCH'))
+        
+        if self.verbose:
+            print(f"      DEBUG: Final TORSDOF in file: {final_torsdof}")
+        
+        return final_torsdof
+
     
     def _get_freeze_reason(self, branch: BranchInfo) -> str:
         """Generate readable freeze reason"""
@@ -970,7 +993,6 @@ class LigandOptimizer:
             reasons.append("deeply nested")
         
         return ", ".join(reasons) if reasons else "low priority score"
-
 
 # ============================================================================
 # OptimizationReporter - Generate reports
