@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-AutoPre Ligand Optimizer v3.0 - COMPLETE REWRITE
-简化、可靠、高泛化能力的配体柔性优化器
-
-核心理念：
-1. 简单可靠的BRANCH移除策略
-2. 化学合理性优先
-3. 最大化保留有价值的柔性
-4. 适用于各种底物
-
-Author: ZymEvo Team
-Date: 2025-12-12
-"""
 
 import os
 import re
@@ -281,16 +268,16 @@ class SimpleLigandOptimizer:
     
     def _remove_branches(self, lines: List[str], remove_ids: Set[int]) -> List[str]:
         """
-        移除指定的BRANCH（简单策略：直接删除BRANCH块）
+        移除指定的BRANCH（改进版：确保BRANCH/ENDBRANCH完全配对）
         
         策略：
         1. 跟踪每个BRANCH的ID
-        2. 遇到要删除的BRANCH时，跳过整个块（包括嵌套）
-        3. 确保BRANCH/ENDBRANCH配对
+        2. 遇到要删除的BRANCH时，跳过整个块（包括所有嵌套内容）
+        3. 使用栈确保BRANCH/ENDBRANCH完全配对删除
         """
         
         new_lines = []
-        skip_depth = 0
+        branch_stack = []  # 栈：[(branch_id, should_skip)]
         branch_counter = -1
         
         for line in lines:
@@ -298,27 +285,41 @@ class SimpleLigandOptimizer:
             if line.startswith('BRANCH'):
                 branch_counter += 1
                 
-                if branch_counter in remove_ids:
-                    # 开始跳过
-                    skip_depth = 1
-                    continue
-                elif skip_depth > 0:
-                    # 嵌套在被跳过的BRANCH内
-                    skip_depth += 1
-                    continue
+                # 检查是否应该跳过这个分支
+                should_skip = branch_counter in remove_ids
+                
+                # 如果父分支被跳过，子分支也跳过
+                if branch_stack and branch_stack[-1][1]:
+                    should_skip = True
+                
+                branch_stack.append((branch_counter, should_skip))
+                
+                # 如果不跳过，保留这行
+                if not should_skip:
+                    new_lines.append(line)
+                
+                continue
             
             # 遇到ENDBRANCH
             elif line.startswith('ENDBRANCH'):
-                if skip_depth > 0:
-                    skip_depth -= 1
-                    continue
+                if branch_stack:
+                    branch_id, should_skip = branch_stack.pop()
+                    
+                    # 只有不跳过的分支才保留ENDBRANCH
+                    if not should_skip:
+                        new_lines.append(line)
+                else:
+                    # 孤立的ENDBRANCH（不应该发生，但保留以防万一）
+                    new_lines.append(line)
+                
+                continue
             
             # TORSDOF行跳过（稍后重新生成）
             if line.startswith('TORSDOF'):
                 continue
             
-            # 不在跳过区域，保留该行
-            if skip_depth == 0:
+            # 其他行：只有当前不在被跳过的分支内时才保留
+            if not branch_stack or not branch_stack[-1][1]:
                 new_lines.append(line)
         
         return new_lines
