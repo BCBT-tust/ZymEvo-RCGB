@@ -136,8 +136,8 @@ class PDBQTValidator:
                         print(f"  ➕ Added TORSDOF {torsdof} (flexible residues)")
                 
                 elif n_atoms > 100:
-                    lines.append("TORSDOF 0\n")
-                    torsdof_value = 0
+                    # lines.append("TORSDOF 0\n")
+                    # torsdof_value = 0
                     messages.append("Added TORSDOF 0 (rigid)")
                     if verbose:
                         print(f"  ➕ Added TORSDOF 0 (rigid receptor)")
