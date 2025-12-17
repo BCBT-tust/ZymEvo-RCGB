@@ -418,12 +418,13 @@ zymevo_results/
 ## 📞 Contact
 
 **Institution**  
+Tianjin Key Laboratory of Industrial Microbiology
 Tianjin University of Science and Technology  
 Research Center for Green BioManufacturing
 
 **Support**
 - GitHub Issues: [Report bugs](https://github.com/BCBT-tust/ZymEvo-RCGB/issues)
-- Email: zhoucr2023@163.com
+- Email: chunruzhou@mail.tust.edu.cn
 
 ---
 
@@ -438,10 +439,8 @@ For commercial use, please contact us.
 ## 🌟 Acknowledgments
 
 **Supported by**:
-- Tianjin Key Laboratory of Industrial Microbiology
-- Tianjin University of Science and Technology
-- Research Center of Green Biomanufacturing 
-
+-
+  
 **Thanks to**:
 - AutoDock Vina team
 - MGLTools contributors
