@@ -79,7 +79,7 @@ Each module (except AutoPrep-Dock) runs **independently**:
 │            │                  │      │ • Format Conv    │               │
 │            │ • P2Rank         │      │ • SMILES Gen     │               │
 │            │ • CAVER          │      │ • Batch Process  │               │
-│            │ • Druggability   │      │ • Multi-format   │               │
+│            │ • Batch Process │      │ • Multi-format   │               │
 │            └──────────────────┘      └──────────────────┘               │
 │                                                                           │
 │         Input: PDB/SDF  →  Output: Engineering Report                   │
@@ -406,7 +406,7 @@ zymevo_results/
 ```bibtex
 @software{zymevo2025,
   title={ZymEvo: Integrated Platform for Enzyme Engineering},
-  author={Zhou, Chengrui and Wang, Zhengxiang and Niu, Dandan},
+  author={Zhou, Chunru and Niu, Dandan and Wang, Zhengxiang },
   year={2025},
   institution={Tianjin University of Science and Technology},
   url={https://github.com/BCBT-tust/ZymEvo-RCGB}
@@ -435,25 +435,6 @@ For commercial use, please contact us.
 
 ---
 
-## 🔄 Roadmap
-
-**Current v1.0** (Jan 2025)
-- ✅ Complete workflow
-- ✅ Independent modules
-- ✅ Dual ML models
-
-**Planned v1.1-1.2** (Q2 2025)
-- 🔄 GPU acceleration
-- 🔄 AlphaFold integration
-- 🔄 Web GUI
-
-**Future v2.0** (2026)
-- 🔮 Deep learning models
-- 🔮 Multi-objective optimization
-- 🔮 Cloud HPC backend
-
----
-
 ## 🌟 Acknowledgments
 
 **Supported by**:
@@ -463,13 +444,15 @@ For commercial use, please contact us.
 **Thanks to**:
 - AutoDock Vina team
 - MGLTools contributors
+- P2Rank team
+- Vaver team
 - Open-source community
 
 ---
 
 <div align="center">
 
-**[🚀 Launch ZymEvo](#)**
+**[🚀 Launch ZymEvo](#https://colab.research.google.com/drive/1zAoga8FUWEzV3DBWOJue1MLHSsTIjfCZ?usp=sharing)**
 
 *From structure to insight in minutes, not weeks.*
 
