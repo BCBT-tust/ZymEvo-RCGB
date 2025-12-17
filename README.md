@@ -438,21 +438,22 @@ For commercial use, please contact us.
 ## 🌟 Acknowledgments
 
 **Supported by**:
-- National Natural Science Foundation of China
+- Tianjin Key Laboratory of Industrial Microbiology
 - Tianjin University of Science and Technology
+- Research Center of Green Biomanufacturing 
 
 **Thanks to**:
 - AutoDock Vina team
 - MGLTools contributors
 - P2Rank team
-- Vaver team
+- Caver team
 - Open-source community
 
 ---
 
 <div align="center">
 
-**[🚀 Launch ZymEvo](#https://colab.research.google.com/drive/1zAoga8FUWEzV3DBWOJue1MLHSsTIjfCZ?usp=sharing)**
+**[🚀 Launch ZymEvo](https://colab.research.google.com/drive/1zAoga8FUWEzV3DBWOJue1MLHSsTIjfCZ?usp=sharing)**
 
 *From structure to insight in minutes, not weeks.*
 
