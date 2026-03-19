@@ -1,20 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-funcsite_predictor.py
-=====================
-FuncSite-ML 推理引擎
-支持输入: PDB结构文件 或 氨基酸序列（FASTA）
-输出: 每个残基的催化相关性(key_prob)和底物特异性(spec_prob)预测
-
-用法（独立运行）:
-  python funcsite_predictor.py \
-    --pdb     input.pdb \
-    --key_model  key_GB_final.pkl \
-    --spec_model spec_GB_final.pkl \
-    --output  predictions.csv
-"""
-
-import os, sys, re, math, warnings, logging, tempfile, subprocess
+import os, re, math, warnings, logging, tempfile, subprocess
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -27,10 +12,6 @@ logging.basicConfig(level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
-
-# ============================================================
-# 氨基酸物化参数（与训练时完全一致）
-# ============================================================
 
 AA3_TO_1 = {
     'ALA':'A','ARG':'R','ASN':'N','ASP':'D','CYS':'C',
@@ -46,10 +27,9 @@ HYDROPHOBICITY = {
     'S':-0.8,'T':-0.7,'W':-0.9,'Y':-1.3,'V':4.2,
 }
 CHARGE_STATE = {
-    'A':0,'R':1,'N':0,'D':-1,'C':0,
-    'Q':0,'E':-1,'G':0,'H':0,'I':0,
-    'L':0,'K':1,'M':0,'F':0,'P':0,
-    'S':0,'T':0,'W':0,'Y':0,'V':0,
+    'A':0,'R':1,'N':0,'D':-1,'C':0,'Q':0,'E':-1,
+    'G':0,'H':0,'I':0,'L':0,'K':1,'M':0,'F':0,
+    'P':0,'S':0,'T':0,'W':0,'Y':0,'V':0,
 }
 PI_VALUES = {
     'A':6.00,'R':10.76,'N':5.41,'D':2.77,'C':5.07,
@@ -89,10 +69,14 @@ FEATURE_COLS = [
 H_MAX = math.log2(20)
 AA20  = list('ACDEFGHIKLMNPQRSTVWY')
 
-
-# ============================================================
-# PDB 解析
-# ============================================================
+POS_CHARGED_RES = {'ARG','LYS','HIS'}
+NEG_CHARGED_RES = {'ASP','GLU'}
+HYDROPHOBIC_RES = {'ALA','VAL','LEU','ILE','PHE','TRP','MET','PRO'}
+AD4_TO_ELEMENT  = {
+    'C':'C','A':'C','N':'N','NA':'N','O':'O','OA':'O',
+    'H':'H','HD':'H','S':'S','SA':'S','P':'P','F':'F',
+    'CL':'CL','BR':'BR','I':'I',
+}
 
 def parse_pdb(pdb_path: Path) -> pd.DataFrame:
     records = []
@@ -101,9 +85,10 @@ def parse_pdb(pdb_path: Path) -> pd.DataFrame:
             if not line.startswith('ATOM'):
                 continue
             try:
+                elem = line[76:78].strip().upper()
                 records.append({
                     'atom_name': line[12:16].strip(),
-                    'element':   line[76:78].strip().upper() or line[12].strip().upper(),
+                    'element':   elem if elem else line[12:16].strip()[0].upper(),
                     'res_name':  line[17:20].strip(),
                     'chain_id':  line[21].strip() or 'A',
                     'res_seq':   int(line[22:26]),
@@ -121,38 +106,33 @@ def residue_table(atom_df: pd.DataFrame) -> pd.DataFrame:
            .drop_duplicates()
            .sort_values(['chain_id','res_seq'])
            .reset_index(drop=True))
-    res['aa1']   = res['res_name'].map(AA3_TO_1).fillna('X')
-    res['res_id']= (res['chain_id']+'_'+res['res_name']+'_'
-                    +res['res_seq'].astype(str))
+    res['aa1'] = res['res_name'].map(AA3_TO_1).fillna('X')
+    # 修复res_id格式：统一为 {chain}_{res3}_{seq}
+    res['res_id'] = (res['chain_id'] + '_'
+                     + res['res_name'] + '_'
+                     + res['res_seq'].astype(str))
     return res
 
-
-# ============================================================
-# P2Rank 口袋预测（可选，有则用）
-# ============================================================
-
-def run_p2rank(pdb_path: Path, p2rank_bin: Optional[Path],
+def run_p2rank(pdb_path: Path,
+               p2rank_bin: Optional[Path],
                tmp_dir: Path) -> Dict[Tuple, float]:
-    """运行P2Rank获取口袋分，若不可用返回空dict"""
     if p2rank_bin is None or not p2rank_bin.exists():
         return {}
     try:
-        out_dir = tmp_dir / 'p2rank_out'
-        out_dir.mkdir(exist_ok=True)
+        out = tmp_dir / 'p2rank_out'
+        out.mkdir(exist_ok=True)
         subprocess.run(
             [str(p2rank_bin), 'predict',
-             '-f', str(pdb_path),
-             '-o', str(out_dir),
-             '-threads', '2'],
+             '-f', str(pdb_path), '-o', str(out), '-threads', '2'],
             capture_output=True, timeout=120)
-        csv_files = list(out_dir.glob('*residues.csv'))
-        if not csv_files:
+        csvs = list(out.glob('*residues.csv'))
+        if not csvs:
             return {}
-        df = pd.read_csv(csv_files[0])
+        df = pd.read_csv(csvs[0])
         df.columns = [c.strip().lower() for c in df.columns]
         score_map = {}
         for _, row in df.iterrows():
-            chain = str(row.get('chain','')).strip() or 'A'
+            chain = str(row.get('chain', '')).strip() or 'A'
             try:
                 seq   = int(str(row['residue_label']).strip())
                 score = float(row['score'])
@@ -161,211 +141,51 @@ def run_p2rank(pdb_path: Path, p2rank_bin: Optional[Path],
             except: pass
         return score_map
     except Exception as e:
-        log.warning(f'P2Rank失败: {e}，F06将使用默认值0')
+        log.warning(f'P2Rank失败: {e}，F06使用默认值0')
         return {}
 
-
-# ============================================================
-# MSA 守恒性（可选，有MAFFT+网络则计算）
-# ============================================================
-
-def compute_conservation_from_sequence(
-        seq: str) -> Dict[int, float]:
-    """
-    尝试从UniProt获取同源序列并计算守恒性。
-    若失败返回默认值0.5。
-    """
-    try:
-        import requests
-        resp = requests.get(
-            'https://rest.uniprot.org/uniprotkb/search',
-            params={'query': 'reviewed:true',
-                    'format':'fasta', 'size':50},
-            timeout=15)
-        if resp.status_code != 200:
-            raise Exception('UniProt不可用')
-        # 简化：返回默认值（完整流程见msa_conservation.py）
-        return {i+1: 0.5 for i in range(len(seq))}
-    except:
-        return {i+1: 0.5 for i in range(len(seq))}
-
-
-# ============================================================
-# 接触特征计算（无对接结果时用口袋中心估算）
-# ============================================================
-
-AD4_TO_ELEMENT = {
-    'C':'C','A':'C','N':'N','NA':'N','O':'O','OA':'O',
-    'H':'H','HD':'H','S':'S','SA':'S','P':'P','F':'F',
-    'CL':'CL','BR':'BR','I':'I',
-}
-
-POS_CHARGED_RES = {'ARG','LYS','HIS'}
-NEG_CHARGED_RES = {'ASP','GLU'}
-HYDROPHOBIC_RES = {'ALA','VAL','LEU','ILE','PHE','TRP','MET','PRO'}
-
-
-def estimate_contact_features_from_pocket(
-        atom_df:      pd.DataFrame,
-        res_df:       pd.DataFrame,
-        pocket_center: np.ndarray) -> Dict[str, Dict]:
-    """
-    无对接文件时，用口袋中心作为虚拟配体位点估算接触特征。
-    仅计算空间距离相关特征，相互作用特征设为0。
-    """
+def _contact_features_from_pocket(atom_df, res_df,
+                                   pocket_center: np.ndarray) -> Dict:
+    """无对接文件时用口袋中心估算"""
     result = {}
-    pocket_pt = pocket_center.reshape(1,3)
-    tree      = cKDTree(pocket_pt)
-
-    for _, res_row in res_df.iterrows():
-        rid   = res_row['res_id']
-        chain = res_row['chain_id']
-        seq   = res_row['res_seq']
-
-        mask      = ((atom_df['chain_id']==chain) &
-                     (atom_df['res_seq']==seq))
-        rec_atoms = atom_df[mask]
-        if rec_atoms.empty:
-            result[rid] = {k:0.0 for k in
+    tree = cKDTree(pocket_center.reshape(1, 3))
+    for _, r in res_df.iterrows():
+        rid  = r['res_id']
+        mask = ((atom_df['chain_id'] == r['chain_id']) &
+                (atom_df['res_seq']  == r['res_seq']))
+        atoms = atom_df[mask]
+        if atoms.empty:
+            result[rid] = {k: 0.0 for k in
                 ['min_distance','contact_frequency','polar_contacts',
                  'ionic_contacts','hydrophobic_contacts']}
             continue
-
-        coords = rec_atoms[['x','y','z']].values
+        coords = atoms[['x','y','z']].values
         dists, _ = tree.query(coords)
-        min_d    = float(dists.min())
-
+        md = float(dists.min())
         result[rid] = {
-            'min_distance':          min_d,
-            'contact_frequency':     max(0.0, 1.0/(1.0+min_d*0.5)),
-            'polar_contacts':        0.0,
-            'ionic_contacts':        0.0,
-            'hydrophobic_contacts':  0.0,
+            'min_distance':         md,
+            'contact_frequency':    max(0.0, 1.0/(1.0 + md*0.5)),
+            'polar_contacts':       0.0,
+            'ionic_contacts':       0.0,
+            'hydrophobic_contacts': 0.0,
         }
     return result
 
 
-# ============================================================
-# 核心特征提取
-# ============================================================
-
-def extract_features(
-        pdb_path:       Path,
-        p2rank_bin:     Optional[Path] = None,
-        pdbqt_files:    Optional[List[Path]] = None,
-        ci_map:         Optional[Dict[int,float]] = None,
-) -> pd.DataFrame:
-    """
-    从PDB文件提取16维特征向量。
-    - p2rank_bin: P2Rank可执行文件路径（可选）
-    - pdbqt_files: 对接结果（可选，有则计算接触特征）
-    - ci_map: 守恒性字典 {res_seq: Ci}（可选）
-    """
-    log.info(f'解析PDB: {pdb_path.name}')
-    atom_df = parse_pdb(pdb_path)
-    res_df  = residue_table(atom_df)
-
-    if res_df.empty:
-        raise ValueError('PDB中无有效残基')
-
-    seq_min = int(res_df['res_seq'].min())
-    seq_max = int(res_df['res_seq'].max())
-    seq_len = max(seq_max - seq_min + 1, 1)
-
-    # CA坐标字典
-    ca_df  = atom_df[atom_df['atom_name']=='CA']
-    ca_map = {(r['chain_id'],r['res_seq']): np.array([r['x'],r['y'],r['z']])
-              for _,r in ca_df.iterrows()}
-
-    # P2Rank 口袋分
-    with tempfile.TemporaryDirectory() as tmp:
-        pocket_scores = run_p2rank(pdb_path, p2rank_bin, Path(tmp))
-
-    # 口袋中心（用于无对接文件时的估算）
-    if pocket_scores:
-        best_key  = max(pocket_scores, key=pocket_scores.get)
-        best_ca   = ca_map.get(best_key)
-        pocket_center = best_ca if best_ca is not None else \
-                        np.mean(list(ca_map.values()), axis=0)
-    else:
-        pocket_center = np.mean(list(ca_map.values()), axis=0)
-
-    # 接触特征
-    if pdbqt_files:
-        contact_feats = _compute_contact_from_pdbqt(
-            atom_df, res_df, pdbqt_files)
-    else:
-        log.info('无对接文件，用口袋中心估算接触特征')
-        contact_feats = estimate_contact_features_from_pocket(
-            atom_df, res_df, pocket_center)
-
-    # 守恒性
-    if ci_map is None:
-        seq_str = ''.join(
-            AA3_TO_1.get(r['res_name'],'X')
-            for _,r in res_df.iterrows())
-        ci_map = compute_conservation_from_sequence(seq_str)
-
-    # 组装16维特征
-    rows = []
-    for _, r in res_df.iterrows():
-        rid   = r['res_id']
-        chain = r['chain_id']
-        seq   = int(r['res_seq'])
-        aa1   = r['aa1']
-        cf    = contact_feats.get(rid, {k:0.0 for k in
-                ['min_distance','contact_frequency','polar_contacts',
-                 'ionic_contacts','hydrophobic_contacts']})
-
-        rows.append({
-            'res_id':  rid,
-            'chain_id':chain,
-            'res_seq': seq,
-            'res_name':r['res_name'],
-            'aa1':     aa1,
-            'F01_min_distance':         cf['min_distance'],
-            'F02_contact_frequency':    cf['contact_frequency'],
-            'F03_polar_contacts':       cf['polar_contacts'],
-            'F04_ionic_contacts':       cf['ionic_contacts'],
-            'F05_hydrophobic_contacts': cf['hydrophobic_contacts'],
-            'F06_pocket_score':         float(
-                pocket_scores.get((chain,seq)) or
-                pocket_scores.get(('A',seq)) or 0.0),
-            'F07_tunnel_descriptor':    999.0,  # 无CAVER时默认
-            'F08_molecular_weight':     MW_VALUES.get(aa1,128.0),
-            'F09_hydrophobicity':       HYDROPHOBICITY.get(aa1,0.0),
-            'F10_charge_state':         float(CHARGE_STATE.get(aa1,0)),
-            'F11_isoelectric_point':    PI_VALUES.get(aa1,6.0),
-            'F12_polarity':             POLARITY.get(aa1,0.0),
-            'F13_sidechain_volume':     SC_VOLUME.get(aa1,100.0),
-            'F14_conservation_score':   ci_map.get(seq,0.5),
-            'F15_conservation_class':   float(
-                3 if ci_map.get(seq,0.5)>0.8
-                else 2 if ci_map.get(seq,0.5)>=0.5 else 1),
-            'F16_relative_position':    (seq-seq_min)/(seq_len-1)
-                                        if seq_len>1 else 0.5,
-        })
-
-    return pd.DataFrame(rows)
-
-
-def _compute_contact_from_pdbqt(atom_df, res_df, pdbqt_files):
-    """有对接文件时计算真实接触特征（只取第1构象最佳pose）"""
-    AD4 = AD4_TO_ELEMENT
-
+def _contact_features_from_pdbqt(atom_df, res_df,
+                                  pdbqt_files: List[Path]) -> Dict:
     feat_keys = ['min_distance','contact_frequency',
                  'polar_contacts','ionic_contacts','hydrophobic_contacts']
-    acc = {r['res_id']:{k:[] for k in feat_keys}
-           for _,r in res_df.iterrows()}
+    acc = {r['res_id']: {k: [] for k in feat_keys}
+           for _, r in res_df.iterrows()}
 
     res_atom_map = {}
-    for _,r in res_df.iterrows():
-        mask = ((atom_df['chain_id']==r['chain_id']) &
-                (atom_df['res_seq']==r['res_seq']))
+    for _, r in res_df.iterrows():
+        mask = ((atom_df['chain_id'] == r['chain_id']) &
+                (atom_df['res_seq']  == r['res_seq']))
         res_atom_map[r['res_id']] = atom_df[mask]
 
     for pf in pdbqt_files:
-        # 只取第1构象
         coords, elements = [], []
         in_m1 = False
         try:
@@ -381,158 +201,287 @@ def _compute_contact_from_pdbqt(atom_df, res_df, pdbqt_files):
                                      float(line[46:54]))
                             ad = line[77:79].strip().upper() if len(line)>77 else 'C'
                             coords.append([x,y,z])
-                            elements.append(AD.get(ad, ad[0] if ad else 'C'))
+                            elements.append(AD4_TO_ELEMENT.get(ad,
+                                            ad[0] if ad else 'C'))
                         except: pass
             if not coords: continue
-            lig = np.array(coords, dtype=np.float32)
-            tree= cKDTree(lig)
+            lig  = np.array(coords, dtype=np.float32)
+            tree = cKDTree(lig)
 
-            for _,rr in res_df.iterrows():
+            for _, rr in res_df.iterrows():
                 rid  = rr['res_id']
                 ra   = res_atom_map[rid]
                 if ra.empty: continue
                 rc   = ra[['x','y','z']].values
-                re   = ra['element'].tolist()
+                re_  = ra['element'].tolist()
                 res3 = rr['res_name']
 
-                dists,_ = tree.query(rc)
+                dists, _ = tree.query(rc)
                 md = float(dists.min())
                 acc[rid]['min_distance'].append(md)
 
-                n_contact = sum(
-                    len(tree.query_ball_point(p, r=4.0)) for p in rc)
+                n_ct = sum(len(tree.query_ball_point(p, r=4.0)) for p in rc)
                 acc[rid]['contact_frequency'].append(
-                    n_contact/max(len(rc)*len(lig),1))
+                    n_ct / max(len(rc)*len(lig), 1))
 
-                # 极性接触
                 pc = 0.0
-                for i,p in enumerate(rc):
-                    if re[i][0] not in {'N','O','S'}: continue
+                for i, p in enumerate(rc):
+                    if re_[i][0] not in {'N','O','S'}: continue
                     for j in tree.query_ball_point(p, r=3.5):
                         if elements[j] in {'N','O','F','S'}:
-                            d = float(np.linalg.norm(p-lig[j]))
-                            pc += (1.5/(1+d)) if d>=2.0 else -(1.5/(d+1e-6))
+                            d = float(np.linalg.norm(p - lig[j]))
+                            pc += (1.5/(1+d)) if d >= 2.0 else -(1.5/(d+1e-6))
                 acc[rid]['polar_contacts'].append(pc)
 
-                # 离子接触
                 ic = 0.0
                 if res3 in POS_CHARGED_RES or res3 in NEG_CHARGED_RES:
                     ctr = rc.mean(0)
-                    for j,lc in enumerate(lig):
+                    for j, lc in enumerate(lig):
                         le = elements[j]
                         if ((res3 in POS_CHARGED_RES and le in {'O','S'}) or
-                            (res3 in NEG_CHARGED_RES and le=='N')):
-                            d = float(np.linalg.norm(ctr-lc))
-                            if d<=4.0:
-                                ic += (1.5/(1+d)) if d>=2.0 else -(1.5/(d+1e-6))
+                            (res3 in NEG_CHARGED_RES and le == 'N')):
+                            d = float(np.linalg.norm(ctr - lc))
+                            if d <= 4.0:
+                                ic += (1.5/(1+d)) if d >= 2.0 else -(1.5/(d+1e-6))
                 acc[rid]['ionic_contacts'].append(ic)
 
-                # 疏水接触
                 hc = 0.0
                 if res3 in HYDROPHOBIC_RES:
-                    for i,p in enumerate(rc):
-                        if re[i][0]!='C': continue
+                    for i, p in enumerate(rc):
+                        if re_[i][0] != 'C': continue
                         for j in tree.query_ball_point(p, r=4.5):
                             if elements[j] in {'C','S','F','CL','BR','I'}:
-                                d = float(np.linalg.norm(p-lig[j]))
+                                d = float(np.linalg.norm(p - lig[j]))
                                 hc += 1.0/(1+d)
                 acc[rid]['hydrophobic_contacts'].append(hc)
+
         except Exception as e:
             log.warning(f'PDBQT解析失败 {pf.name}: {e}')
 
-    return {rid:{k:float(np.mean(v)) if v else 0.0
-                 for k,v in d.items()}
-            for rid,d in acc.items()}
+    return {rid: {k: float(np.mean(v)) if v else 0.0
+                  for k, v in d.items()}
+            for rid, d in acc.items()}
 
+def get_conservation(seq: str) -> Dict[int, float]:
+    try:
+        import requests, subprocess as sp
+        resp = requests.get(
+            'https://rest.uniprot.org/uniprotkb/search',
+            params={'query': f'reviewed:true', 'format': 'fasta', 'size': 30},
+            timeout=10)
+        if resp.status_code != 200:
+            raise Exception()
+        return {i+1: 0.5 for i in range(len(seq))}
+    except:
+        return {i+1: 0.5 for i in range(len(seq))}
 
-# ============================================================
-# 预测推理
-# ============================================================
+def extract_features(pdb_path:    Path,
+                     p2rank_bin:  Optional[Path] = None,
+                     pdbqt_files: Optional[List[Path]] = None,
+                     ci_map:      Optional[Dict] = None) -> pd.DataFrame:
 
-def predict(pdb_path:    Path,
-            key_model_path:  Path,
-            spec_model_path: Path,
-            p2rank_bin:  Optional[Path] = None,
-            pdbqt_files: Optional[List[Path]] = None,
-            ci_map:      Optional[Dict] = None,
-            key_threshold:  float = 0.5,
-            spec_threshold: float = 0.5) -> pd.DataFrame:
-    """
-    主预测函数。
-    返回每个残基的预测概率DataFrame。
-    """
+    log.info(f'解析PDB: {pdb_path.name}')
+    atom_df = parse_pdb(pdb_path)
+    res_df  = residue_table(atom_df)
+    if res_df.empty:
+        raise ValueError('PDB中无有效残基')
+
+    seq_min = int(res_df['res_seq'].min())
+    seq_len = max(int(res_df['res_seq'].max()) - seq_min + 1, 1)
+
+    ca_df  = atom_df[atom_df['atom_name'] == 'CA']
+    ca_map = {(r['chain_id'], r['res_seq']):
+              np.array([r['x'], r['y'], r['z']])
+              for _, r in ca_df.iterrows()}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pocket_scores = run_p2rank(pdb_path, p2rank_bin, Path(tmp))
+
+    if pocket_scores:
+        best = max(pocket_scores, key=pocket_scores.get)
+        pocket_center = ca_map.get(best,
+                        np.mean(list(ca_map.values()), axis=0))
+    else:
+        pocket_center = np.mean(list(ca_map.values()), axis=0)
+
+    if pdbqt_files:
+        cf_map = _contact_features_from_pdbqt(atom_df, res_df, pdbqt_files)
+    else:
+        cf_map = _contact_features_from_pocket(atom_df, res_df, pocket_center)
+
+    if ci_map is None:
+        seq_str = ''.join(AA3_TO_1.get(r['res_name'], 'X')
+                          for _, r in res_df.iterrows())
+        ci_map = get_conservation(seq_str)
+
+    rows = []
+    for _, r in res_df.iterrows():
+        rid   = r['res_id']
+        chain = r['chain_id']
+        seq   = int(r['res_seq'])
+        aa1   = r['aa1']
+        cf    = cf_map.get(rid, {k: 0.0 for k in
+                ['min_distance','contact_frequency','polar_contacts',
+                 'ionic_contacts','hydrophobic_contacts']})
+        ci    = ci_map.get(seq, 0.5)
+
+        rows.append({
+            'chain_id':  chain,
+            'res_seq':   seq,
+            'res_name':  r['res_name'],
+            'aa1':       aa1,
+            'F01_min_distance':         cf['min_distance'],
+            'F02_contact_frequency':    cf['contact_frequency'],
+            'F03_polar_contacts':       cf['polar_contacts'],
+            'F04_ionic_contacts':       cf['ionic_contacts'],
+            'F05_hydrophobic_contacts': cf['hydrophobic_contacts'],
+            'F06_pocket_score':         float(
+                pocket_scores.get((chain, seq)) or
+                pocket_scores.get(('A', seq)) or 0.0),
+            'F07_tunnel_descriptor':    999.0,
+            'F08_molecular_weight':     MW_VALUES.get(aa1, 128.0),
+            'F09_hydrophobicity':       HYDROPHOBICITY.get(aa1, 0.0),
+            'F10_charge_state':         float(CHARGE_STATE.get(aa1, 0)),
+            'F11_isoelectric_point':    PI_VALUES.get(aa1, 6.0),
+            'F12_polarity':             POLARITY.get(aa1, 0.0),
+            'F13_sidechain_volume':     SC_VOLUME.get(aa1, 100.0),
+            'F14_conservation_score':   ci,
+            'F15_conservation_class':   float(3 if ci > 0.8
+                                              else 2 if ci >= 0.5 else 1),
+            'F16_relative_position':    (seq - seq_min) / (seq_len - 1)
+                                        if seq_len > 1 else 0.5,
+        })
+
+    return pd.DataFrame(rows)
+
+def predict(pdb_path:        Path,
+            rf_key_model:    Path,
+            rf_spec_model:   Path,
+            gb_key_model:    Path,
+            gb_spec_model:   Path,
+            p2rank_bin:      Optional[Path] = None,
+            pdbqt_files:     Optional[List[Path]] = None,
+            ci_map:          Optional[Dict] = None,
+            key_threshold:   float = 0.4,
+            spec_threshold:  float = 0.4,
+            rf_weight:       float = 0.5,
+            gb_weight:       float = 0.5) -> pd.DataFrame:
     import joblib
 
-    # 提取特征
-    feat_df = extract_features(pdb_path, p2rank_bin,
-                               pdbqt_files, ci_map)
+    feat_df = extract_features(pdb_path, p2rank_bin, pdbqt_files, ci_map)
     X = np.nan_to_num(feat_df[FEATURE_COLS].values.astype(float))
 
-    # 加载模型并预测
-    key_pipe  = joblib.load(key_model_path)
-    spec_pipe = joblib.load(spec_model_path)
+    rf_key  = joblib.load(rf_key_model)
+    rf_spec = joblib.load(rf_spec_model)
+    gb_key  = joblib.load(gb_key_model)
+    gb_spec = joblib.load(gb_spec_model)
 
-    key_prob  = key_pipe.predict_proba(X)[:,1]
-    spec_prob = spec_pipe.predict_proba(X)[:,1]
+    key_prob  = (rf_weight * rf_key.predict_proba(X)[:,1] +
+                 gb_weight * gb_key.predict_proba(X)[:,1])
+    spec_prob = (rf_weight * rf_spec.predict_proba(X)[:,1] +
+                 gb_weight * gb_spec.predict_proba(X)[:,1])
 
-    feat_df['key_prob']       = key_prob
-    feat_df['spec_prob']      = spec_prob
-    feat_df['key_pred']       = (key_prob  >= key_threshold).astype(int)
-    feat_df['spec_pred']      = (spec_prob >= spec_threshold).astype(int)
-    feat_df['dual_functional']= (
-        (key_prob  >= key_threshold) &
-        (spec_prob >= spec_threshold)).astype(int)
+    feat_df['key_prob']  = key_prob
+    feat_df['spec_prob'] = spec_prob
 
-    # 排序输出
-    result = feat_df[['res_id','chain_id','res_seq','res_name','aa1',
-                       'key_prob','spec_prob','key_pred','spec_pred',
-                       'dual_functional'] + FEATURE_COLS].copy()
-    result = result.sort_values('key_prob', ascending=False)
-    return result
+    is_key  = key_prob  >= key_threshold
+    is_spec = spec_prob >= spec_threshold
 
+    def func_type(k, s):
+        if k and s:  return 'Dual-functional'
+        if k:        return 'Catalytic'
+        if s:        return 'Specificity'
+        return 'Background'
 
-# ============================================================
-# CLI 入口
-# ============================================================
+    feat_df['function_type'] = [func_type(k, s)
+                                 for k, s in zip(is_key, is_spec)]
+
+    feat_df['functional_score'] = np.maximum(key_prob, spec_prob)
+
+    func_df = feat_df[feat_df['function_type'] != 'Background'].copy()
+    func_df = func_df.sort_values('functional_score', ascending=False
+                                  ).reset_index(drop=True)
+    func_df.index += 1   # 排名从1开始
+
+    func_df['position'] = (func_df['res_name'] + str('') +
+                           func_df['res_seq'].astype(str))
+    func_df['chain']    = func_df['chain_id']
+    func_df['score']    = func_df['functional_score'].round(3)
+
+    def confidence(score):
+        if score >= 0.7: return 'High'
+        if score >= 0.5: return 'Medium'
+        return 'Low'
+
+    func_df['confidence'] = func_df['score'].apply(confidence)
+
+    output = func_df[[
+        'position', 'chain', 'aa1',
+        'function_type', 'score', 'confidence',
+        'key_prob', 'spec_prob',
+    ]].copy()
+    output.columns = [
+        'Residue', 'Chain', 'AA',
+        'Function', 'Score', 'Confidence',
+        'Catalytic_prob', 'Specificity_prob',
+    ]
+    output['Catalytic_prob']    = output['Catalytic_prob'].round(3)
+    output['Specificity_prob']  = output['Specificity_prob'].round(3)
+
+    full_df = feat_df[['chain_id','res_seq','res_name','aa1',
+                       'key_prob','spec_prob','function_type',
+                       'functional_score']].copy()
+    full_df.columns = ['Chain','Position','Residue','AA',
+                       'Catalytic_prob','Specificity_prob',
+                       'Function','Score']
+    full_df = full_df.sort_values('Score', ascending=False)
+    full_df['Catalytic_prob']   = full_df['Catalytic_prob'].round(3)
+    full_df['Specificity_prob'] = full_df['Specificity_prob'].round(3)
+    full_df['Score']            = full_df['Score'].round(3)
+
+    return output, full_df
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(
-        description='FuncSite-ML 功能位点预测')
-    parser.add_argument('--pdb',        required=True)
-    parser.add_argument('--key_model',  required=True)
-    parser.add_argument('--spec_model', required=True)
-    parser.add_argument('--p2rank',     default=None,
-                        help='P2Rank可执行文件路径（可选）')
-    parser.add_argument('--pdbqt_dir',  default=None,
-                        help='对接结果目录（可选）')
-    parser.add_argument('--output',     default='predictions.csv')
-    parser.add_argument('--key_thr',    type=float, default=0.5)
-    parser.add_argument('--spec_thr',   type=float, default=0.5)
+        description='FuncSite-ML v2 (RF+GB Ensemble)')
+    parser.add_argument('--pdb',          required=True)
+    parser.add_argument('--rf_key',       required=True)
+    parser.add_argument('--rf_spec',      required=True)
+    parser.add_argument('--gb_key',       required=True)
+    parser.add_argument('--gb_spec',      required=True)
+    parser.add_argument('--pdbqt_dir',    default=None)
+    parser.add_argument('--p2rank',       default=None)
+    parser.add_argument('--key_thr',      type=float, default=0.4)
+    parser.add_argument('--spec_thr',     type=float, default=0.4)
+    parser.add_argument('--output',       default='results')
     args = parser.parse_args()
 
-    pdbqt_files = None
-    if args.pdbqt_dir:
-        pdbqt_files = list(Path(args.pdbqt_dir).glob('*.pdbqt'))
+    pdbqt = list(Path(args.pdbqt_dir).glob('*.pdbqt')) \
+            if args.pdbqt_dir else None
 
-    result = predict(
-        pdb_path        = Path(args.pdb),
-        key_model_path  = Path(args.key_model),
-        spec_model_path = Path(args.spec_model),
-        p2rank_bin      = Path(args.p2rank) if args.p2rank else None,
-        pdbqt_files     = pdbqt_files,
-        key_threshold   = args.key_thr,
-        spec_threshold  = args.spec_thr,
+    output, full = predict(
+        pdb_path       = Path(args.pdb),
+        rf_key_model   = Path(args.rf_key),
+        rf_spec_model  = Path(args.rf_spec),
+        gb_key_model   = Path(args.gb_key),
+        gb_spec_model  = Path(args.gb_spec),
+        p2rank_bin     = Path(args.p2rank) if args.p2rank else None,
+        pdbqt_files    = pdbqt,
+        key_threshold  = args.key_thr,
+        spec_threshold = args.spec_thr,
     )
-    result.to_csv(args.output, index=False)
-    log.info(f'预测完成: {args.output}')
 
-    print(f'\n{"="*50}')
-    print(f'总残基数: {len(result)}')
-    print(f'催化相关残基 (key_pred=1): {result["key_pred"].sum()}')
-    print(f'特异性残基   (spec_pred=1): {result["spec_pred"].sum()}')
-    print(f'双功能残基:  {result["dual_functional"].sum()}')
-    print(f'\nTop 5 催化位点:')
-    for _,r in result.head(5).iterrows():
-        print(f'  {r["res_id"]:>15}  key_prob={r["key_prob"]:.3f}  '
-              f'spec_prob={r["spec_prob"]:.3f}')
+    print(f'\n{"="*55}')
+    print(f' FuncSite-ML Results — {Path(args.pdb).stem}')
+    print(f'{"="*55}')
+    print(f' Functional residues identified: {len(output)}')
+    for ft in ['Dual-functional','Catalytic','Specificity']:
+        n = (output['Function'] == ft).sum()
+        if n: print(f'   {ft}: {n}')
+    print(f'{"="*55}\n')
+    print(output.to_string())
+
+    output.to_csv(f'{args.output}_summary.csv',  index_label='Rank')
+    full.to_csv(  f'{args.output}_full.csv',     index=False)
+    print(f'\nSaved: {args.output}_summary.csv  |  {args.output}_full.csv')
