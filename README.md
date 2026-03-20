@@ -452,7 +452,7 @@ For commercial use, please contact us.
 
 <div align="center">
 
-**[🚀 Launch ZymEvo](https://colab.research.google.com/drive/1zAoga8FUWEzV3DBWOJue1MLHSsTIjfCZ?usp=sharing)**
+**[🚀 Launch ZymEvo](https://colab.research.google.com/drive/1D_Hgy5dy5gTDngJAHsK4Rc-4u9vK5DKo?usp=sharing)**
 
 *From structure to insight in minutes, not weeks.*
 
