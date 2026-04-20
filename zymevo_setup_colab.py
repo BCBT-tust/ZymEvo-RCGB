@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 ZymEvo Environment Setup Script
 Tianjin University of Science and Technology
@@ -21,6 +22,7 @@ PREPARE_RECEPTOR = f"{MGLTOOLS_DIR}/MGLToolsPckgs/AutoDockTools/Utilities24/prep
 PREPARE_LIGAND = f"{MGLTOOLS_DIR}/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_ligand4.py"
 PYTHONSH_PATH = f"{MGLTOOLS_DIR}/bin/pythonsh"
 
+# Scripps server has an SSL SAN mismatch; --no-check-certificate is required.
 WGET_OPTS = "--no-check-certificate -q"
 
 def print_status(message, status="info"):
@@ -42,6 +44,7 @@ def print_status(message, status="info"):
 
 
 def run_cmd(command, description=None, check=True):
+    """Run a shell command. If check=True, raise on non-zero exit."""
     if description:
         print_status(f"{description}...", "info")
 
@@ -52,6 +55,7 @@ def run_cmd(command, description=None, check=True):
             print_status(f"{description} completed", "success")
         return result
 
+    # Non-zero
     err_tail = (result.stderr or result.stdout or "").strip()[-300:]
     if description:
         print_status(f"{description} failed: {err_tail}", "error")
@@ -61,22 +65,26 @@ def run_cmd(command, description=None, check=True):
 
 
 def install_mgltools():
+    """Download + extract MGLTools. Idempotent: skips if already installed,
     otherwise cleans partial state before re-downloading."""
     if os.path.exists(PREPARE_RECEPTOR):
         print_status("AutoDockTools already installed (verified by file check)", "success")
         return
 
+    # Clean any partial residue (empty dir, stale tarball) before retry.
     if os.path.exists(MGLTOOLS_DIR):
         print_status("Removing incomplete AutoDockTools directory...", "warning")
         run_cmd(f"rm -rf {MGLTOOLS_DIR}", check=True)
     if os.path.exists(MGLTOOLS_TARBALL):
         run_cmd(f"rm -f {MGLTOOLS_TARBALL}", check=True)
 
+    # Download (SSL cert on Scripps has SAN mismatch; must bypass).
     run_cmd(
         f"wget {WGET_OPTS} {MGLTOOLS_URL} -O {MGLTOOLS_TARBALL}",
         "Downloading MGLTools 1.5.7 (~60MB)",
     )
 
+    # Sanity-check file size. If Scripps returned an error page, it'll be tiny.
     size = os.path.getsize(MGLTOOLS_TARBALL) if os.path.exists(MGLTOOLS_TARBALL) else 0
     if size < 50_000_000:
         raise RuntimeError(
@@ -84,6 +92,7 @@ def install_mgltools():
             f"Check connectivity to ccsb.scripps.edu."
         )
 
+    # Extract (two-layer: outer tar + inner MGLToolsPckgs.tar.gz).
     run_cmd(f"mkdir -p {MGLTOOLS_DIR}", check=True)
     run_cmd(
         f"tar -xzf {MGLTOOLS_TARBALL} -C {MGLTOOLS_DIR} --strip-components=1",
@@ -101,10 +110,12 @@ def install_mgltools():
 
 
 def configure_pythonsh():
+    """Create the pythonsh wrapper that routes AutoDockTools scripts to Python 2.7."""
     os.makedirs(os.path.dirname(PYTHONSH_PATH), exist_ok=True)
     with open(PYTHONSH_PATH, "w") as f:
         f.write("#!/bin/bash\n/usr/bin/python2.7 \"$@\"\n")
     os.chmod(PYTHONSH_PATH, 0o755)
+
 
 def main():
     display(HTML("""
@@ -149,9 +160,10 @@ def main():
             "apt-get install -y openbabel python3-openbabel",
             "Installing OpenBabel via apt-get",
         )
+
         print_status("Step 4/6: Installing AutoDockTools")
         install_mgltools()
-        
+
         print_status("Step 5/6: Configuring pythonsh")
         configure_pythonsh()
 
@@ -197,6 +209,7 @@ def main():
     html += "</table></div>"
     display(HTML(html))
 
+    # Always clean up tarballs, regardless of success.
     run_cmd(
         f"rm -f Miniconda3-latest-Linux-x86_64.sh {MGLTOOLS_TARBALL}",
         "Cleaning up downloads",
