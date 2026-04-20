@@ -88,6 +88,18 @@ def main():
 
     print_status("Step 5/6: Configuring pythonsh")
     pythonsh_path = "/usr/local/autodocktools/bin/pythonsh"
+    mgltools_pkgs = "/usr/local/autodocktools/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_receptor4.py"
+    
+    if not os.path.exists(mgltools_pkgs):
+        # 清理可能的残留空目录
+        if os.path.exists('/usr/local/autodocktools'):
+            run_cmd("rm -rf /usr/local/autodocktools")
+        run_cmd("wget -q https://ccsb.scripps.edu/mgltools/download/491/tars/releases/REL1.5.7/mgltools_x86_64Linux2_1.5.7.tar.gz")
+        run_cmd("mkdir -p /usr/local/autodocktools")
+        run_cmd("tar -xzf mgltools_x86_64Linux2_1.5.7.tar.gz -C /usr/local/autodocktools --strip-components=1")
+        run_cmd("tar -xzf /usr/local/autodocktools/MGLToolsPckgs.tar.gz -C /usr/local/autodocktools/")
+    else:
+        print_status("AutoDockTools already installed", "success")
     with open(pythonsh_path, "w") as f:
         f.write("#!/bin/bash\n/usr/bin/python2.7 \"$@\"\n")
     os.chmod(pythonsh_path, 0o755)
