@@ -71,6 +71,59 @@ def get_element(atom_name: str) -> str:
     return name[0]
 
 
+def standardize_pdb_for_receptor_prep(inp_pdb: str, out_pdb: str) -> str:
+    """Rewrite loose FoldX PDB records into strict PDB columns.
+
+    FoldX can emit readable but non-column-strict PDB lines, e.g.
+    "ATOM 0 N LEU A 15 x y z ...". AutoDockTools prepare_receptor4 is more
+    reliable when the PDB is first normalized to fixed-width PDB columns.
+    """
+    serial = 1
+    wrote_atom = False
+    with open(inp_pdb) as fin, open(out_pdb, "w") as fout:
+        for raw in fin:
+            if raw.startswith(("ATOM", "HETATM")):
+                rec = raw[:6].strip() or "ATOM"
+                parts = raw.split()
+                try:
+                    if len(parts) >= 11 and parts[0] in ("ATOM", "HETATM"):
+                        atom_name = parts[2]
+                        res_name = parts[3]
+                        chain = parts[4] or "A"
+                        res_num = int(float(parts[5]))
+                        x, y, z = map(float, parts[6:9])
+                        occ = float(parts[9])
+                        bfac = float(parts[10])
+                    else:
+                        atom_name = raw[12:16].strip()
+                        res_name = raw[17:20].strip()
+                        chain = raw[21:22].strip() or "A"
+                        res_num = int(raw[22:26])
+                        x = float(raw[30:38])
+                        y = float(raw[38:46])
+                        z = float(raw[46:54])
+                        occ = float(raw[54:60] or 1.0)
+                        bfac = float(raw[60:66] or 0.0)
+                except (IndexError, ValueError):
+                    continue
+                elem = get_element(atom_name).title()
+                fout.write(
+                    f"{rec:<6}{serial:5d} {atom_name:<4} {res_name:>3} "
+                    f"{chain:1}{res_num:4d}    "
+                    f"{x:8.3f}{y:8.3f}{z:8.3f}"
+                    f"{occ:6.2f}{bfac:6.2f}          {elem:>2}\n"
+                )
+                serial += 1
+                wrote_atom = True
+            elif raw.startswith(("TER", "END")):
+                fout.write(raw if raw.endswith("\n") else raw + "\n")
+        if wrote_atom:
+            fout.write("END\n")
+    if not wrote_atom:
+        raise RuntimeError(f"standardized PDB has no ATOM/HETATM records: {inp_pdb}")
+    return out_pdb
+
+
 def residue_id(res_name: str, res_num: str, chain: str) -> str:
     """FuncSite-ML residue_id convention: e.g. 'SER139A'."""
     return f"{res_name}{res_num}{chain or 'A'}"
@@ -659,12 +712,26 @@ class FoldXMutator:
 
     @staticmethod
     def _pick_mutant_pdb(mut_dir: str) -> Optional[str]:
-        # FoldX writes e.g. <name>_1.pdb ; WT copies are <name>_1_WT*.pdb
-        cands = [p for p in glob.glob(os.path.join(mut_dir, "*_*.pdb"))
-                 if "WT_" not in os.path.basename(p)
-                 and "_WT" not in os.path.basename(p)
-                 and "Repair" not in os.path.basename(p)]
-        return sorted(cands)[0] if cands else None
+        """Pick the mutant PDB produced by FoldX BuildModel.
+
+        FoldX can write mutant files such as WT_Repair_1_0.pdb when the input
+        structure is WT_Repair.pdb. WT control files are usually named
+        WT_WT_Repair_1_0.pdb, so we exclude only those WT controls and keep
+        repaired-output mutant names.
+        """
+        preferred, fallback = [], []
+        for p in sorted(glob.glob(os.path.join(mut_dir, "*.pdb"))):
+            name = os.path.basename(p)
+            lower = name.lower()
+            if lower.startswith("wt_wt_") or "_wt_" in lower:
+                continue
+            if re.search(r"_\d+(?:_\d+)?\.pdb$", name):
+                preferred.append(p)
+            else:
+                fallback.append(p)
+        if preferred:
+            return sorted(preferred)[0]
+        return sorted(fallback)[0] if fallback else None
 
 
 class PDBToPDBQTConverter:
@@ -885,20 +952,38 @@ def select_candidate_sites(residue_features: pd.DataFrame,
     return site_ids, weight_map
 
 
-def make_obabel_converter(obabel_bin: str = "obabel") -> "PDBToPDBQTConverter":
-    """PDB -> PDBQT via OpenBabel (the AutoMolConvert backend), as a fallback.
+def make_prepare_receptor4_converter(prepare_receptor4: str,
+                                     pythonsh: Optional[str] = None
+                                     ) -> "PDBToPDBQTConverter":
+    """PDB -> receptor PDBQT via AutoDockTools prepare_receptor4.py.
 
-    NOTE: for receptors, AutoPrep-Dock's prepare_receptor4 path is preferred
-    (consistent Gasteiger charges / nonpolar-H merging). Use this only when
-    AutoPrep-Dock is not wired in.
+    This is the intended receptor-preparation path for Vina. The input PDB is
+    first normalized to strict PDB columns so FoldX BuildModel outputs can be
+    consumed reliably by AutoDockTools.
     """
-    tmpl = f'{obabel_bin} -ipdb "{{inp}}" -opdbqt -O "{{out}}" -xr'
-    return PDBToPDBQTConverter(command_template=tmpl)
+    if not prepare_receptor4:
+        raise ValueError("prepare_receptor4 path is required")
+
+    def _convert(inp: str, out: str) -> None:
+        clean = str(Path(out).with_suffix(".prepare_receptor4_clean.pdb"))
+        standardize_pdb_for_receptor_prep(inp, clean)
+        if pythonsh:
+            cmd = [pythonsh, prepare_receptor4, "-r", clean, "-o", out,
+                   "-A", "hydrogens"]
+        elif os.access(prepare_receptor4, os.X_OK):
+            cmd = [prepare_receptor4, "-r", clean, "-o", out,
+                   "-A", "hydrogens"]
+        else:
+            raise RuntimeError(
+                "prepare_receptor4.py is not executable and pythonsh was not "
+                "provided; pass pythonsh=/path/to/pythonsh"
+            )
+        _run(cmd, cwd=None, timeout=600, what="prepare_receptor4")
+
+    return PDBToPDBQTConverter(fn=_convert)
 
 
 def run_pipeline(residue_features: pd.DataFrame,
-                 wt_receptor_pdbqt: str,
-                 wt_ligand_pose_pdbqt: str,
                  ligand_pdbqt: str,
                  box: dict,
                  wt_pdb_for_foldx: str,
@@ -906,6 +991,7 @@ def run_pipeline(residue_features: pd.DataFrame,
                  vina_bin: str,
                  converter: "PDBToPDBQTConverter",
                  work_dir: str,
+                 wt_ligand_pose_pdbqt: Optional[str] = None,
                  config: Optional[EnvelopeConfig] = None,
                  sites: Optional[Sequence[str]] = None,
                  select_kwargs: Optional[dict] = None,
@@ -914,14 +1000,14 @@ def run_pipeline(residue_features: pd.DataFrame,
 
     residue_features : FuncSite-ML output (residue_id, catalytic_prob,
                        specificity_prob, ...).
-    wt_receptor_pdbqt: WT receptor PDBQT used by Vina. This can be a manually
-                       uploaded PDBQT prepared outside this script.
-    wt_ligand_pose_pdbqt: WT docked substrate pose (the reference pose).
     ligand_pdbqt     : substrate ligand to re-dock into every mutant.
     box              : locked WT MultiOpt box (center_/size_).
     wt_pdb_for_foldx : WT structure in PDB for FoldX RepairPDB/BuildModel.
+    wt_ligand_pose_pdbqt: optional WT docked substrate pose PDBQT. If omitted,
+                       it is generated by docking ligand_pdbqt into the WT
+                       receptor prepared from FoldX-repaired WT PDB.
     wt_reference_structure: optional clean WT PDB/PDBQT used only for
-                       reference contacts. Defaults to wt_pdb_for_foldx.
+                       reference contacts. Defaults to FoldX-repaired WT PDB.
     """
     config = config or EnvelopeConfig()
     os.makedirs(work_dir, exist_ok=True)
@@ -933,8 +1019,21 @@ def run_pipeline(residue_features: pd.DataFrame,
     if not sites:
         raise ValueError("no candidate sites selected; relax select_kwargs")
 
-    validate_receptor_structure(wt_receptor_pdbqt, "WT docking receptor PDBQT")
-    reference_structure = wt_reference_structure or wt_pdb_for_foldx
+    # 2) external tools and WT receptor preparation
+    repaired = FoldXMutator.repair(foldx_bin, wt_pdb_for_foldx, work_dir)
+    wt_receptor_pdbqt = converter.convert(
+        repaired, os.path.join(work_dir, "wt_receptor.pdbqt"))
+
+    docker = LockedBoxDocker(vina_bin, box, config,
+                             log_dir=os.path.join(work_dir, "vina_logs"))
+
+    if wt_ligand_pose_pdbqt is None:
+        wt_ligand_pose_pdbqt = os.path.join(work_dir, "wt_reference_pose.pdbqt")
+        poses = docker.dock(wt_receptor_pdbqt, ligand_pdbqt, wt_ligand_pose_pdbqt)
+        if not poses:
+            raise ValueError("WT reference docking produced no pose")
+
+    reference_structure = wt_reference_structure or repaired
     wt_receptor = validate_receptor_structure(
         reference_structure, "WT reference receptor structure")
     with open(wt_ligand_pose_pdbqt) as f:
@@ -945,11 +1044,7 @@ def run_pipeline(residue_features: pd.DataFrame,
                       key=lambda p: p["score"], default=wt_poses[0])
     reference = ReferenceEnvelope(wt_receptor, wt_ref_pose, config, weight_map)
 
-    # 2) external tools
-    repaired = FoldXMutator.repair(foldx_bin, wt_pdb_for_foldx, work_dir)
     mutator = FoldXMutator(foldx_bin, repaired, os.path.join(work_dir, "foldx"))
-    docker = LockedBoxDocker(vina_bin, box, config,
-                             log_dir=os.path.join(work_dir, "vina_logs"))
 
     # 3) screen
     flt = EnvelopeFilter(reference, config, mutator, converter, docker,
@@ -1084,13 +1179,12 @@ def _build_cli():
     p.add_argument("--funcsite-csv",
                    help="FuncSite-ML residue_features CSV (residue_id, "
                         "catalytic_prob, specificity_prob)")
-    p.add_argument("--wt-receptor", "--wt-receptor-pdbqt", dest="wt_receptor",
-                   help="WT receptor PDBQT for Vina; upload/provide this if "
-                        "OpenBabel receptor preparation is unreliable")
     p.add_argument("--wt-reference-structure",
                    help="clean WT PDB/PDBQT used only for reference contacts; "
-                        "defaults to --wt-pdb")
-    p.add_argument("--wt-ligand-pose", help="WT docked substrate pose PDBQT")
+                        "defaults to FoldX-repaired WT PDB")
+    p.add_argument("--wt-ligand-pose",
+                   help="optional WT docked substrate pose PDBQT; if omitted, "
+                        "it is generated by docking --ligand into prepared WT")
     p.add_argument("--ligand", help="substrate ligand PDBQT to re-dock")
     p.add_argument("--wt-pdb", help="WT structure PDB for FoldX")
     p.add_argument("--box", help="Vina box config file (center_/size_)")
@@ -1098,7 +1192,11 @@ def _build_cli():
     p.add_argument("--vina-bin", default="vina")
     p.add_argument("--converter-cmd",
                    help='PDB->PDBQT command template with {inp} {out}; '
-                        'if omitted, OpenBabel is used')
+                        'advanced override; prefer --prepare-receptor4')
+    p.add_argument("--prepare-receptor4",
+                   help="AutoDockTools prepare_receptor4.py path")
+    p.add_argument("--pythonsh",
+                   help="MGLTools pythonsh path used to run prepare_receptor4.py")
     p.add_argument("--sites", help="comma-separated residue_ids (override "
                                    "auto-selection), or a .txt file")
     p.add_argument("--top-k", type=int, default=8)
@@ -1123,10 +1221,15 @@ def _cli_main():
         _selftest()
         return
 
-    required = ["wt_receptor", "wt_ligand_pose", "ligand", "wt_pdb", "box"]
+    required = ["ligand", "wt_pdb", "box"]
     missing = [r for r in required if getattr(args, r) is None]
     if missing:
         raise SystemExit(f"missing required args: {missing}")
+    if args.converter_cmd is None and args.prepare_receptor4 is None:
+        raise SystemExit(
+            "missing required arg: --prepare-receptor4 "
+            "(or provide --converter-cmd as an advanced override)"
+        )
 
     cfg = EnvelopeConfig()
     for attr in ("rmsd_cap", "retention_floor", "score_band",
@@ -1146,7 +1249,8 @@ def _cli_main():
     if args.converter_cmd:
         converter = PDBToPDBQTConverter(command_template=args.converter_cmd)
     else:
-        converter = make_obabel_converter()
+        converter = make_prepare_receptor4_converter(
+            args.prepare_receptor4, pythonsh=args.pythonsh)
 
     sites = None
     if args.sites:
@@ -1158,8 +1262,6 @@ def _cli_main():
 
     df = run_pipeline(
         residue_features=residue_features,
-        wt_receptor_pdbqt=args.wt_receptor,
-        wt_ligand_pose_pdbqt=args.wt_ligand_pose,
         ligand_pdbqt=args.ligand,
         box=box,
         wt_pdb_for_foldx=args.wt_pdb,
@@ -1167,10 +1269,11 @@ def _cli_main():
         vina_bin=args.vina_bin,
         converter=converter,
         work_dir=args.work_dir,
+        wt_ligand_pose_pdbqt=args.wt_ligand_pose,
         config=cfg,
         sites=sites,
         select_kwargs={"top_k": args.top_k},
-        wt_reference_structure=args.wt_reference_structure or args.wt_pdb,
+        wt_reference_structure=args.wt_reference_structure,
     )
     df.to_csv(args.out, index=False)
     n_keep = int(df["survived"].sum()) if not df.empty else 0
