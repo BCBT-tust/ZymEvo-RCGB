@@ -77,7 +77,7 @@ def residue_id(res_name: str, res_num: str, chain: str) -> str:
 
 
 def parse_receptor_pdbqt(content: str) -> Dict[str, dict]:
-    """Parse a receptor PDBQT into {residue_id: {res_name,res_num,chain,atoms}}."""
+    """Parse a receptor PDB/PDBQT into {residue_id: {res_name,res_num,chain,atoms}}."""
     residues: Dict[str, dict] = {}
     for line in content.split("\n"):
         if line.startswith(("ATOM", "HETATM")):
@@ -94,6 +94,24 @@ def parse_receptor_pdbqt(content: str) -> Dict[str, dict]:
                 rid, {"res_name": res_name, "res_num": res_num,
                       "chain": chain, "atoms": {}})
             res["atoms"][atom_name] = [x, y, z]
+    return residues
+
+
+def validate_receptor_structure(path: str, label: str = "receptor") -> Dict[str, dict]:
+    """Read and validate a receptor PDB/PDBQT before scoring or docking."""
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"{label} not found: {path}")
+    with open(path) as f:
+        content = f.read()
+    has_atom_line = any(ln.startswith(("ATOM", "HETATM"))
+                        for ln in content.splitlines())
+    if not has_atom_line:
+        raise ValueError(f"{label} has no ATOM/HETATM lines: {path}")
+    residues = parse_receptor_pdbqt(content)
+    if not residues:
+        raise ValueError(
+            f"{label} contains ATOM/HETATM lines but no parseable residues: {path}"
+        )
     return residues
 
 
@@ -673,6 +691,7 @@ class PDBToPDBQTConverter:
         if not os.path.exists(out_pdbqt):
             raise RuntimeError(f"converter produced no output: {out_pdbqt}")
         self._strip_torsdof(out_pdbqt)
+        validate_receptor_structure(out_pdbqt, "converted receptor PDBQT")
         return out_pdbqt
 
     @staticmethod
@@ -790,8 +809,8 @@ class EnvelopeFilter:
                 out_pdbqt = os.path.join(
                     self.work_dir, f"recv_{site_residue_id}_{aa}.pdbqt")
                 self.converter.convert(mut_pdb, out_pdbqt)
-                with open(out_pdbqt) as f:
-                    mut_receptor = parse_receptor_pdbqt(f.read())
+                mut_receptor = validate_receptor_structure(
+                    mut_pdb, "mutant receptor PDB")
                 dock_out = os.path.join(
                     self.work_dir, f"dock_{site_residue_id}_{aa}.pdbqt")
                 poses = self.docker.dock(out_pdbqt, self.ligand_pdbqt, dock_out)
@@ -889,16 +908,20 @@ def run_pipeline(residue_features: pd.DataFrame,
                  work_dir: str,
                  config: Optional[EnvelopeConfig] = None,
                  sites: Optional[Sequence[str]] = None,
-                 select_kwargs: Optional[dict] = None) -> pd.DataFrame:
+                 select_kwargs: Optional[dict] = None,
+                 wt_reference_structure: Optional[str] = None) -> pd.DataFrame:
     """One call: FuncSite-ML scores in, (sites + mutation screen) table out.
 
     residue_features : FuncSite-ML output (residue_id, catalytic_prob,
                        specificity_prob, ...).
-    wt_receptor_pdbqt: WT receptor used to build the reference envelope.
+    wt_receptor_pdbqt: WT receptor PDBQT used by Vina. This can be a manually
+                       uploaded PDBQT prepared outside this script.
     wt_ligand_pose_pdbqt: WT docked substrate pose (the reference pose).
     ligand_pdbqt     : substrate ligand to re-dock into every mutant.
     box              : locked WT MultiOpt box (center_/size_).
     wt_pdb_for_foldx : WT structure in PDB for FoldX RepairPDB/BuildModel.
+    wt_reference_structure: optional clean WT PDB/PDBQT used only for
+                       reference contacts. Defaults to wt_pdb_for_foldx.
     """
     config = config or EnvelopeConfig()
     os.makedirs(work_dir, exist_ok=True)
@@ -910,8 +933,10 @@ def run_pipeline(residue_features: pd.DataFrame,
     if not sites:
         raise ValueError("no candidate sites selected; relax select_kwargs")
 
-    with open(wt_receptor_pdbqt) as f:
-        wt_receptor = parse_receptor_pdbqt(f.read())
+    validate_receptor_structure(wt_receptor_pdbqt, "WT docking receptor PDBQT")
+    reference_structure = wt_reference_structure or wt_pdb_for_foldx
+    wt_receptor = validate_receptor_structure(
+        reference_structure, "WT reference receptor structure")
     with open(wt_ligand_pose_pdbqt) as f:
         wt_poses = parse_ligand_poses(f.read())
     if not wt_poses:
@@ -1059,7 +1084,12 @@ def _build_cli():
     p.add_argument("--funcsite-csv",
                    help="FuncSite-ML residue_features CSV (residue_id, "
                         "catalytic_prob, specificity_prob)")
-    p.add_argument("--wt-receptor", help="WT receptor PDBQT (reference)")
+    p.add_argument("--wt-receptor", "--wt-receptor-pdbqt", dest="wt_receptor",
+                   help="WT receptor PDBQT for Vina; upload/provide this if "
+                        "OpenBabel receptor preparation is unreliable")
+    p.add_argument("--wt-reference-structure",
+                   help="clean WT PDB/PDBQT used only for reference contacts; "
+                        "defaults to --wt-pdb")
     p.add_argument("--wt-ligand-pose", help="WT docked substrate pose PDBQT")
     p.add_argument("--ligand", help="substrate ligand PDBQT to re-dock")
     p.add_argument("--wt-pdb", help="WT structure PDB for FoldX")
@@ -1140,6 +1170,7 @@ def _cli_main():
         config=cfg,
         sites=sites,
         select_kwargs={"top_k": args.top_k},
+        wt_reference_structure=args.wt_reference_structure or args.wt_pdb,
     )
     df.to_csv(args.out, index=False)
     n_keep = int(df["survived"].sum()) if not df.empty else 0
