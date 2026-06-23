@@ -43,6 +43,7 @@ CLASH_CUTOFF = 2.0         # steric clash (same threshold FuncSite-ML penalises)
 
 CONTACT_TYPES = ("ionic", "polar", "halogen", "hydrophobic")
 DEFAULT_REFERENCE_POSE_ENSEMBLE_N = 5
+FUNCKEEP_ENGINE_VERSION = "2026-06-23-ddg-report-only-rmsd-ensemble5"
 
 AA3TO1 = {
     "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
@@ -463,8 +464,8 @@ class EnvelopeConfig:
     retention_floor: float = 0.70    # min weighted key-contact retention
     rmsd_cap: float = 2.0            # max substrate pose RMSD vs WT (A)
     score_band: float = 1.5          # max docking-score worsening (kcal/mol)
-    ddg_guard_line: float = 2.5      # exclude if global ddG > this (unfolding)
-    fail_on_missing_ddg: bool = True # NaN ddG -> exclude (do not silently pass)
+    ddg_guard_line: float = 2.5      # reported only; not used as a hard filter
+    fail_on_missing_ddg: bool = False # ddG is reported, never used to delete hits
     symmetry_safe_rmsd: bool = False # element-wise assignment for symmetric ligands
 
     # --- key-contact set definition on WT ---
@@ -623,11 +624,10 @@ class EnvelopeScorer:
             reasons.append("pose_drift")
         if not np.isnan(dscore) and dscore > cfg.score_band:
             reasons.append("score_drop")
-        if np.isnan(ddg_guard):
-            if cfg.fail_on_missing_ddg:
-                reasons.append("ddg_missing")  # do NOT let NaN slip past the guard
-        elif ddg_guard > cfg.ddg_guard_line:
-            reasons.append("unfolding")
+        # FoldX ddG is reported as an auxiliary diagnostic only. It is not used
+        # as a hard gate because static FoldX energy can disagree with
+        # experimentally observed thermal adaptation for local functional-site
+        # mutations.
 
         survived = len(reasons) == 0
 
@@ -748,20 +748,30 @@ class FoldXMutator:
 
     @staticmethod
     def _parse_ddg(mut_dir: str) -> float:
+        """Parse FoldX BuildModel Dif_*.fxout and return min total energy.
+
+        FoldX fxout files start with banner lines such as "FoldX 5.1 (2011)".
+        Only rows whose first column is a generated mutant PDB are data rows.
+        When numberOfRuns > 1, the minimum total energy is used as a conservative
+        report value for the best generated mutant structure. This value is
+        reported in the CSV but is not a hard filter.
+        """
         dif = glob.glob(os.path.join(mut_dir, "Dif_*.fxout"))
         if not dif:
             return float("nan")
+        values: List[float] = []
         with open(dif[0]) as f:
             for line in f:
-                if line.startswith("Pdb") or not line.strip():
-                    continue
                 parts = line.split()
-                if len(parts) >= 2:
-                    try:
-                        return float(parts[1])
-                    except ValueError:
-                        continue
-        return float("nan")
+                if len(parts) < 2:
+                    continue
+                if not parts[0].endswith(".pdb"):
+                    continue
+                try:
+                    values.append(float(parts[1]))
+                except ValueError:
+                    continue
+        return min(values) if values else float("nan")
 
     @staticmethod
     def _pick_mutant_pdb(mut_dir: str) -> Optional[str]:
@@ -1181,9 +1191,9 @@ def _selftest() -> None:
     assert not r_bad.survived
     assert "pose_drift" in r_bad.fail_reasons
 
-    # (3) unfolding guard: fine envelope but ddG huge -> excluded
+    # (3) ddG is reported only: fine envelope still survives despite high ddG
     r_unf = scorer.score("SER139A", "G", receptor, [good_pose], ddg_guard=5.0)
-    assert not r_unf.survived and "unfolding" in r_unf.fail_reasons
+    assert r_unf.survived and "unfolding" not in r_unf.fail_reasons
 
     # (4) clash: drop a ligand atom on top of ASP OD1 (13,10,10)
     clash = parse_ligand_poses(_mini_ligand_pose(-7.0))[0]
@@ -1199,10 +1209,10 @@ def _selftest() -> None:
     assert abs(ligand_rmsd(wt_pose, reordered)) < 1e-9  # name match beats order
     assert abs(ligand_rmsd(wt_pose, reordered, symmetry_safe=True)) < 1e-9
 
-    # (6) ddG missing must NOT pass silently
+    # (6) missing ddG is reported as NaN only, not used as a deletion rule
     r_nan = scorer.score("SER139A", "W", receptor, [good_pose],
                          ddg_guard=float("nan"))
-    assert not r_nan.survived and "ddg_missing" in r_nan.fail_reasons
+    assert r_nan.survived and "ddg_missing" not in r_nan.fail_reasons
 
     # (7) mutation-string mapping
     assert FoldXMutator.mutation_string("SER139A", "W") == "SA139W;"
@@ -1222,9 +1232,9 @@ def _selftest() -> None:
     print(f"  key residues (WT): {sorted(ref.key_weights)}")
     print(f"  benign  E={r_good.E}  retention={r_good.contact_retention}")
     print(f"  drift   reasons={r_bad.fail_reasons}")
-    print(f"  unfold  reasons={r_unf.fail_reasons}")
+    print(f"  high-ddg report-only survived={r_unf.survived}")
     print(f"  clash   new_clash={r_clash.n_new_clash}")
-    print(f"  ddg-nan reasons={r_nan.fail_reasons}")
+    print(f"  ddg-nan report-only survived={r_nan.survived}")
     print(f"  selected sites={sites}")
 
 
@@ -1267,12 +1277,14 @@ def _build_cli():
     p.add_argument("--rmsd-cap", type=float)
     p.add_argument("--retention-floor", type=float)
     p.add_argument("--score-band", type=float)
-    p.add_argument("--ddg-guard-line", type=float)
+    p.add_argument("--ddg-guard-line", type=float,
+                   help="kept for compatibility; ddG is reported only and "
+                        "does not delete candidates")
     p.add_argument("--exhaustiveness", type=int)
     p.add_argument("--seed", type=int)
     p.add_argument("--symmetry-safe-rmsd", action="store_true")
     p.add_argument("--allow-missing-ddg", action="store_true",
-                   help="do NOT exclude on missing ddG (not recommended)")
+                   help="kept for compatibility; missing ddG is reported only")
     return p
 
 
