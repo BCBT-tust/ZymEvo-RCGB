@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
 import os
-import subprocess
+import re
+import time
 import json
+import zipfile
+import subprocess
 import pandas as pd
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -17,16 +20,79 @@ class ProteinAnalyzer:
         self.output_dir = self.work_dir / "output"
         self.p2rank_output = self.output_dir / "p2rank"
         self.caver_output = self.output_dir / "caver"
+        self.fpocket_output = self.output_dir / "fpocket"
+        self.integrated_output = self.output_dir / "integrated_summary"
 
         self.p2rank_path = self.work_dir / "p2rank_2.4.2"
         self.caver_path = self.work_dir
 
+        # fpocket is compiled lazily on first use and cached here
+        self.fpocket_src = Path("/content/fpocket_src")
+        self.fpocket_bin: Optional[str] = None
+
         self._create_directories()
         
     def _create_directories(self):
-        for directory in [self.input_dir, self.output_dir, 
-                          self.p2rank_output, self.caver_output]:
+        for directory in [self.input_dir, self.output_dir,
+                          self.p2rank_output, self.caver_output,
+                          self.fpocket_output, self.integrated_output]:
             directory.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Input handling: sanitize file names so spaces / parentheses in
+    # uploaded names (e.g. "WT (2).pdb") never break P2Rank / CAVER.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _safe_stem(path) -> str:
+        """Filesystem/CLI-safe stem: only [A-Za-z0-9_.-], no leading/trailing junk."""
+        stem = Path(path).stem
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("_.")
+        return stem or "structure"
+
+    @staticmethod
+    def _pdb_has_atoms(pdb_path) -> bool:
+        try:
+            with open(pdb_path, "r", errors="ignore") as f:
+                for line in f:
+                    if line.startswith("ATOM"):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    def prepare_inputs(self, uploaded_paths, clear_existing: bool = True) -> List[Path]:
+        """
+        Copy uploaded structures into input_dir with sanitized names.
+        Drops files with no ATOM records and avoids duplicate-name collisions.
+        Returns the clean list of PDB paths the pipeline will analyze.
+        """
+        if clear_existing:
+            for old in self.input_dir.glob("*.pdb"):
+                old.unlink(missing_ok=True)
+
+        clean_files: List[Path] = []
+        used = set()
+        for src in uploaded_paths:
+            src = Path(src)
+            if not self._pdb_has_atoms(src):
+                print(f"   ⚠️ Skipping {src.name}: no ATOM records")
+                continue
+
+            stem = self._safe_stem(src)
+            candidate = stem
+            i = 2
+            while candidate in used:           # de-duplicate cleanly (no "(2)")
+                candidate = f"{stem}_{i}"
+                i += 1
+            used.add(candidate)
+
+            dst = self.input_dir / f"{candidate}.pdb"
+            shutil.copy2(src, dst)
+            clean_files.append(dst)
+            label = src.name if src.name == dst.name else f"{src.name} → {dst.name}"
+            print(f"   • {label}")
+
+        return sorted(clean_files)
 
     def setup_environment(self):
         print("=" * 70)
@@ -161,8 +227,9 @@ class ProteinAnalyzer:
                 "-threads", str(threads)
             ]
 
-            if min_score > 0:
-                cmd.extend(["-min_score", str(min_score)])
+            # NOTE: P2Rank's `predict` has NO -min_score parameter (passing it
+            # raises "Invalid parameter name: min_score"). Score filtering is
+            # therefore applied as POST-PROCESSING on the parsed pockets below.
             
             try:
                 result = subprocess.run(
@@ -174,11 +241,12 @@ class ProteinAnalyzer:
                 
                 if result.returncode == 0:
                     print("   ✅ P2Rank completed")
-                    pocket_info = self._parse_p2rank_results(output_subdir, pdb_file.stem)
+                    pocket_info = self._parse_p2rank_results(
+                        output_subdir, pdb_file.stem, min_score=min_score)
                     results[pdb_file.stem] = pocket_info
                 else:
                     print("   ❌ P2Rank failed")
-                    print(result.stderr[:200])
+                    print(result.stderr[:400])
                     results[pdb_file.stem] = {"error": result.stderr}
                     
             except subprocess.TimeoutExpired:
@@ -194,7 +262,8 @@ class ProteinAnalyzer:
         
         return results
 
-    def _parse_p2rank_results(self, output_dir: Path, pdb_name: str) -> Dict:
+    def _parse_p2rank_results(self, output_dir: Path, pdb_name: str,
+                              min_score: float = 0.0) -> Dict:
         pocket_info: Dict[str, object] = {
             "pdb_name": pdb_name,
             "pockets": [],
@@ -209,11 +278,7 @@ class ProteinAnalyzer:
         try:
             df = pd.read_csv(csv_files[0], skipinitialspace=True)
 
-            pocket_info["summary"] = {
-                "total_pockets": len(df),
-                "output_file": str(csv_files[0])
-            }
-
+            all_pockets = []
             for idx, row in df.iterrows():
                 pocket = {
                     "name": str(row.get("name", f"pocket{idx+1}")),
@@ -225,10 +290,23 @@ class ProteinAnalyzer:
                     "center_z": float(row.get("center_z", 0.0)),
                     "residue_ids": str(row.get("residue_ids", "")).strip()
                 }
-                pocket_info["pockets"].append(pocket)
+                all_pockets.append(pocket)
 
-            if pocket_info["pockets"]:
-                top = pocket_info["pockets"][0]
+            # Post-processing score filter (replaces the invalid -min_score CLI flag)
+            kept = [p for p in all_pockets if p["score"] >= min_score]
+            pocket_info["pockets"] = kept
+            pocket_info["summary"] = {
+                "total_pockets": len(kept),
+                "pockets_before_filter": len(all_pockets),
+                "min_score": min_score,
+                "output_file": str(csv_files[0])
+            }
+
+            if min_score > 0:
+                print(f"      ✓ Score filter ≥ {min_score}: kept {len(kept)}/{len(all_pockets)} pockets")
+
+            if kept:
+                top = kept[0]
                 print(
                     f"      ✓ Top pocket: score={top['score']:.2f}, "
                     f"prob={top['probability']:.3f}, "
@@ -596,8 +674,19 @@ seed 1
         
         return result
 
-    def generate_summary_report(self, p2rank_results: Dict, caver_results: Dict) -> pd.DataFrame:
+    def generate_summary_report(self, p2rank_results: Dict, caver_results: Dict,
+                                fpocket_selected_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         print("\n📋 Generating Summary Report...")
+
+        # Build a per-protein lookup of the selected functional pocket from fpocket
+        fp_lookup: Dict[str, Dict] = {}
+        if isinstance(fpocket_selected_df, pd.DataFrame) and not fpocket_selected_df.empty:
+            for _, r in fpocket_selected_df.iterrows():
+                fp_lookup[str(r.get("protein", ""))] = {
+                    "vol": r.get("fpocket_volume_A3", 0.0),
+                    "fscore": r.get("fpocket_score", 0.0),
+                    "hits": r.get("active_site_hit_count", 0),
+                }
 
         report_rows = []
         proteins = sorted(set(p2rank_results.keys()) | set(caver_results.keys()))
@@ -605,6 +694,7 @@ seed 1
         for p in proteins:
             r1 = p2rank_results.get(p, {})
             r2 = caver_results.get(p, {})
+            fp = fp_lookup.get(p, {})
 
             top_score = 0.0
             top_prob = 0.0
@@ -616,13 +706,13 @@ seed 1
             row = {
                 "Protein": p,
                 "Total_Pockets": r1.get("summary", {}).get("total_pockets", 0),
-                "Top_Pocket_Score": top_score,
-                "Top_Pocket_Probability": top_prob,
+                "Top_Pocket_Score": round(top_score, 2),
+                "Top_Pocket_Probability": round(top_prob, 3),
                 "Tunnel_Count": r2.get("summary", {}).get("tunnel_count", 0),
-                "Avg_Throughput": round(r2.get("summary", {}).get("avg_throughput", 0.0), 3),
                 "Avg_Bottleneck_Radius": round(r2.get("summary", {}).get("avg_bottleneck", 0.0), 3),
                 "Avg_Length": round(r2.get("summary", {}).get("avg_length", 0.0), 2),
-                "Avg_Curvature": round(r2.get("summary", {}).get("avg_curvature", 0.0), 3),
+                "Func_Pocket_Volume_A3": round(float(fp.get("vol", 0.0)), 1),
+                "Active_Site_Hits": int(fp.get("hits", 0)),
                 "P2Rank_Status": "Success" if "error" not in r1 else "Failed",
                 "CAVER_Status": "Success" if "error" not in r2 else "Failed",
             }
@@ -669,20 +759,354 @@ seed 1
             df.to_csv(csv_path, index=False)
             print(f"📊 Tunnel details saved to: {csv_path}")
 
+    # ==================================================================
+    # fpocket: pocket-volume / druggability analysis (moved into engine)
+    # ==================================================================
+    @staticmethod
+    def _parse_target_residue_numbers(active_site_resids) -> set:
+        out = set()
+        for x in str(active_site_resids).split(","):
+            x = x.strip()
+            if x:
+                out.add(x)
+        return out
+
+    @staticmethod
+    def _test_fpocket_binary(exe) -> bool:
+        try:
+            subprocess.run([str(exe), "-h"], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True, timeout=20)
+            return True
+        except Exception:
+            return False
+
+    def _setup_fpocket(self) -> str:
+        """Install + compile fpocket once, cache the binary for later reruns."""
+        if self.fpocket_bin and self._test_fpocket_binary(self.fpocket_bin):
+            return self.fpocket_bin
+
+        print("\n🧬 Setting up fpocket...")
+        src_dir = self.fpocket_src
+
+        if src_dir.exists():
+            for exe in src_dir.rglob("fpocket"):
+                if exe.is_file() and os.access(exe, os.X_OK) and self._test_fpocket_binary(exe):
+                    print(f"   ✅ Using cached fpocket: {exe}")
+                    self.fpocket_bin = str(exe)
+                    return self.fpocket_bin
+
+        subprocess.run(["apt-get", "update", "-qq"], check=True, timeout=180)
+        subprocess.run(["apt-get", "install", "-y", "-qq", "git", "build-essential"],
+                       check=True, timeout=240)
+
+        if not src_dir.exists():
+            print("   • Cloning fpocket source...")
+            subprocess.run(["git", "clone", "--depth", "1",
+                            "https://github.com/Discngine/fpocket.git", str(src_dir)],
+                           check=True, timeout=240)
+
+        print("   • Compiling fpocket...")
+        subprocess.run(["make"], cwd=str(src_dir), check=True, timeout=420)
+
+        for exe in src_dir.rglob("fpocket"):
+            if not exe.is_file():
+                continue
+            try:
+                exe.chmod(0o755)
+            except Exception:
+                pass
+            if self._test_fpocket_binary(exe):
+                print(f"   ✅ fpocket ready: {exe}")
+                self.fpocket_bin = str(exe)
+                return self.fpocket_bin
+
+        raise FileNotFoundError("fpocket binary not found / not executable after compilation")
+
+    @staticmethod
+    def _make_protein_only_pdb(input_pdb, output_pdb):
+        """Keep ATOM + TER/END, drop all HETATM (ligands, cofactors, ions, waters)."""
+        kept = 0
+        with open(input_pdb, "r", errors="ignore") as fin, open(output_pdb, "w") as fout:
+            for line in fin:
+                if line.startswith("ATOM"):
+                    fout.write(line)
+                    kept += 1
+                elif line.startswith(("TER", "END")):
+                    fout.write(line)
+        if kept == 0:
+            raise ValueError(f"No ATOM records found in {input_pdb}")
+        return output_pdb
+
+    @staticmethod
+    def _parse_fpocket_info(info_file, protein_name) -> List[Dict]:
+        rows, current = [], None
+        key_map = {
+            "score": "fpocket_score",
+            "druggability score": "fpocket_druggability_score",
+            "drug score": "fpocket_druggability_score",
+            "number of alpha spheres": "num_alpha_spheres",
+            "total sasa": "total_sasa",
+            "polar sasa": "polar_sasa",
+            "apolar sasa": "apolar_sasa",
+            "volume": "fpocket_volume_A3",
+            "mean local hydrophobic density": "mean_local_hydrophobic_density",
+            "mean alpha sphere radius": "mean_alpha_sphere_radius",
+            "mean alp. sph. radius": "mean_alpha_sphere_radius",
+            "mean alp. sph. solvent access": "mean_alpha_sphere_solvent_access",
+            "apolar alpha sphere proportion": "apolar_alpha_sphere_proportion",
+            "hydrophobicity score": "hydrophobicity_score",
+            "polarity score": "polarity_score",
+            "charge score": "charge_score",
+        }
+        info_file = Path(info_file)
+        if not info_file.exists():
+            return rows
+        with open(info_file, "r", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                m = re.match(r"Pocket\s+(\d+)\s*:", line, flags=re.IGNORECASE)
+                if m:
+                    if current:
+                        rows.append(current)
+                    current = {"protein": protein_name, "fpocket_pocket_id": int(m.group(1))}
+                    continue
+                if current and ":" in line:
+                    raw_key, raw_value = line.split(":", 1)
+                    key = raw_key.strip().lower()
+                    num = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", raw_value.strip())
+                    if num:
+                        out_key = key_map.get(key, key.replace(" ", "_"))
+                        try:
+                            current[out_key] = float(num.group(0))
+                        except ValueError:
+                            pass
+        if current:
+            rows.append(current)
+        return rows
+
+    @staticmethod
+    def _read_fpocket_pocket_residues(pocket_atm_file) -> List[str]:
+        """Residue identifiers as Chain_ResidueNumber_ResidueName, e.g. A_84_GLN."""
+        residues = set()
+        pocket_atm_file = Path(pocket_atm_file)
+        if not pocket_atm_file.exists():
+            return []
+        with open(pocket_atm_file, "r", errors="ignore") as f:
+            for line in f:
+                if line.startswith(("ATOM", "HETATM")):
+                    resn = line[17:20].strip()
+                    chain = line[21].strip() or "X"
+                    resi = line[22:26].strip()
+                    icode = line[26].strip()
+                    if resi:
+                        residues.add(f"{chain}_{resi}{icode}_{resn}")
+        return sorted(residues)
+
+    @staticmethod
+    def _annotate_fpocket_residue_hits(row, pocket_residues, target_resids):
+        hit_residues = []
+        for r in pocket_residues:
+            parts = r.split("_")
+            if len(parts) >= 2:
+                resi_only = re.sub(r"[^0-9]", "", parts[1])
+                if resi_only and resi_only in target_resids:
+                    hit_residues.append(r)
+        row["pocket_residues"] = " ".join(pocket_residues)
+        row["active_site_hit_count"] = len(hit_residues)
+        row["active_site_hit_residues"] = " ".join(hit_residues)
+        return row
+
+    @staticmethod
+    def _select_active_site_fpocket_pockets(fpocket_df) -> pd.DataFrame:
+        """Per protein: most active-site hits → higher fpocket_score → larger volume."""
+        if fpocket_df is None or fpocket_df.empty:
+            return pd.DataFrame()
+        df = fpocket_df.copy()
+        for col in ["active_site_hit_count", "fpocket_score", "fpocket_volume_A3"]:
+            if col not in df.columns:
+                df[col] = 0
+        df = df.sort_values(
+            by=["protein", "active_site_hit_count", "fpocket_score", "fpocket_volume_A3"],
+            ascending=[True, False, False, False])
+        return df.groupby("protein", as_index=False).head(1).reset_index(drop=True)
+
+    def run_fpocket(self, pdb_files: List[str] = None,
+                    active_site_resids: str = "",
+                    timeout: int = 300,
+                    protein_only: bool = True):
+        """Run fpocket on all PDBs; return (all_pockets_df, selected_active_site_df)."""
+        print("\n" + "=" * 70)
+        print("🧬 Running fpocket Pocket-Volume Analysis...")
+        print("=" * 70)
+
+        if pdb_files is None:
+            pdb_files = list(self.input_dir.glob("*.pdb"))
+        else:
+            pdb_files = [Path(f) for f in pdb_files]
+
+        if not pdb_files:
+            print("⚠️ No PDB files found for fpocket")
+            return pd.DataFrame(), pd.DataFrame()
+
+        fpocket_bin = self._setup_fpocket()
+        target_resids = self._parse_target_residue_numbers(active_site_resids)
+        all_rows = []
+
+        for pdb_path in pdb_files:
+            pdb_path = Path(pdb_path)
+            safe_stem = self._safe_stem(pdb_path)
+            work_dir = self.fpocket_output / safe_stem
+            work_dir.mkdir(parents=True, exist_ok=True)
+
+            raw_pdb = work_dir / f"{safe_stem}_raw.pdb"
+            work_pdb = work_dir / f"{safe_stem}.pdb"
+            shutil.copy2(pdb_path, raw_pdb)
+
+            try:
+                if protein_only:
+                    self._make_protein_only_pdb(raw_pdb, work_pdb)
+                    mode = "protein-only"
+                else:
+                    shutil.copy2(raw_pdb, work_pdb)
+                    mode = "original"
+            except Exception as e:
+                print(f"   ⚠️ Protein-only conversion failed for {pdb_path.name}: {e}; using original")
+                shutil.copy2(raw_pdb, work_pdb)
+                mode = "original-fallback"
+
+            print(f"\n   ▶ fpocket: {pdb_path.name}  (mode: {mode})")
+            try:
+                subprocess.run([fpocket_bin, "-f", str(work_pdb)],
+                               cwd=str(work_dir), check=True, timeout=timeout,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+                fpocket_out_dir = work_dir / f"{safe_stem}_out"
+                info_file = fpocket_out_dir / f"{safe_stem}_info.txt"
+                if not info_file.exists():
+                    cands = list(fpocket_out_dir.glob("*_info.txt"))
+                    if cands:
+                        info_file = cands[0]
+
+                rows = self._parse_fpocket_info(info_file, safe_stem)
+                for row in rows:
+                    pocket_id = int(row["fpocket_pocket_id"])
+                    pocket_atm = fpocket_out_dir / "pockets" / f"pocket{pocket_id}_atm.pdb"
+                    pocket_residues = self._read_fpocket_pocket_residues(pocket_atm)
+                    row["original_pdb"] = pdb_path.name
+                    row["fpocket_mode"] = mode
+                    self._annotate_fpocket_residue_hits(row, pocket_residues, target_resids)
+                all_rows.extend(rows)
+                print(f"      ✅ {len(rows)} pockets parsed")
+
+            except subprocess.TimeoutExpired:
+                print(f"      ❌ fpocket timeout for {pdb_path.name}")
+            except subprocess.CalledProcessError as e:
+                print(f"      ❌ fpocket failed for {pdb_path.name}: {(e.stderr or '')[:300]}")
+            except Exception as e:
+                print(f"      ❌ fpocket failed for {pdb_path.name}: {e}")
+
+        fpocket_df = pd.DataFrame(all_rows)
+        if fpocket_df.empty:
+            print("⚠️ No fpocket pockets parsed.")
+            return fpocket_df, pd.DataFrame()
+
+        out_csv = self.fpocket_output / "fpocket_pocket_volumes.csv"
+        fpocket_df.to_csv(out_csv, index=False)
+        print(f"\n📄 fpocket all-pocket result: {out_csv}")
+
+        selected_df = self._select_active_site_fpocket_pockets(fpocket_df)
+        selected_csv = self.fpocket_output / "fpocket_active_site_pocket_candidates.csv"
+        selected_df.to_csv(selected_csv, index=False)
+        print(f"📄 fpocket active-site candidates: {selected_csv}")
+
+        return fpocket_df, selected_df
+
+    # ==================================================================
+    # High-level orchestration (so Colab stays a thin frontend)
+    # ==================================================================
+    def analyze(self, pdb_files: List[str] = None,
+                p2rank_threads: int = 2, p2rank_min_score: float = 0.0,
+                caver_probe_radius: float = 0.9,
+                run_fpocket: bool = True, fpocket_protein_only: bool = True,
+                active_site_resids: str = "", fpocket_timeout: int = 300) -> Dict:
+        """Run P2Rank + CAVER + fpocket, build the merged report, return a result bundle."""
+        if pdb_files is None:
+            pdb_files = sorted(self.input_dir.glob("*.pdb"))
+
+        t0 = time.time()
+
+        p2rank_results = self.run_p2rank(pdb_files=pdb_files,
+                                         min_score=p2rank_min_score,
+                                         threads=p2rank_threads)
+
+        try:
+            caver_results = self.run_caver(pdb_files=pdb_files,
+                                           probe_radius=caver_probe_radius)
+        except Exception as e:
+            print(f"⚠️ CAVER step failed, continuing: {e}")
+            caver_results = {}
+
+        fpocket_all_df, fpocket_selected_df = pd.DataFrame(), pd.DataFrame()
+        if run_fpocket:
+            try:
+                fpocket_all_df, fpocket_selected_df = self.run_fpocket(
+                    pdb_files=pdb_files,
+                    active_site_resids=active_site_resids,
+                    timeout=fpocket_timeout,
+                    protein_only=fpocket_protein_only)
+            except Exception as e:
+                print(f"⚠️ fpocket step failed, continuing: {e}")
+
+        summary_df = self.generate_summary_report(
+            p2rank_results, caver_results, fpocket_selected_df)
+        self.save_detailed_results(p2rank_results, caver_results)
+
+        # Consolidated copies for convenience
+        if not summary_df.empty:
+            summary_df.to_csv(self.integrated_output / "summary_report.csv", index=False)
+        if not fpocket_all_df.empty:
+            fpocket_all_df.to_csv(self.integrated_output / "fpocket_all_pockets.csv", index=False)
+        if not fpocket_selected_df.empty:
+            fpocket_selected_df.to_csv(
+                self.integrated_output / "fpocket_selected_active_site_pockets.csv", index=False)
+
+        counts = {
+            "proteins": len(pdb_files),
+            "p2rank_pockets": sum(len(v.get("pockets", [])) for v in p2rank_results.values()),
+            "caver_tunnels": sum(len(v.get("tunnels", [])) for v in caver_results.values()),
+            "fpocket_pockets": int(len(fpocket_all_df)),
+            "elapsed_s": round(time.time() - t0, 1),
+        }
+
+        return {
+            "summary_df": summary_df,
+            "fpocket_all_df": fpocket_all_df,
+            "fpocket_selected_df": fpocket_selected_df,
+            "p2rank_results": p2rank_results,
+            "caver_results": caver_results,
+            "counts": counts,
+        }
+
+    def package_results(self, zip_path: str = "/content/analysis_results.zip") -> str:
+        """Zip the whole output directory for download (pure stdlib)."""
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files_list in os.walk(self.output_dir):
+                for f in files_list:
+                    full = os.path.join(root, f)
+                    zf.write(full, os.path.relpath(full, self.output_dir))
+        return zip_path
+
 def main():
     analyzer = ProteinAnalyzer()
-    
     analyzer.setup_environment()
 
-    p2rank_results = analyzer.run_p2rank()
+    pdb_files = sorted(analyzer.input_dir.glob("*.pdb"))
+    result = analyzer.analyze(pdb_files=pdb_files)
 
-    caver_results = analyzer.run_caver(probe_radius=0.9)
-
-    summary_df = analyzer.generate_summary_report(p2rank_results, caver_results)
-    analyzer.save_detailed_results(p2rank_results, caver_results)
-
-    return analyzer, summary_df, p2rank_results, caver_results
+    print("\n📊 Summary:")
+    print(result["summary_df"].to_string(index=False))
+    return analyzer, result
 
 
 if __name__ == "__main__":
-    analyzer, summary_df, p2rank_results, caver_results = main()
+    analyzer, result = main()
