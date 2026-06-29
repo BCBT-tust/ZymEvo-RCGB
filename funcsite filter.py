@@ -14,11 +14,6 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-
-# =============================================================================
-# Constants -- mirror FuncSite-ML so the contact definition stays identical
-# =============================================================================
-
 CHARGED_POS = {"LYS", "ARG", "HIS"}
 CHARGED_NEG = {"ASP", "GLU"}
 CHARGED_ALL = CHARGED_POS | CHARGED_NEG
@@ -53,11 +48,6 @@ AA3TO1 = {
 }
 AA1TO3 = {v: k for k, v in AA3TO1.items()}
 STANDARD_AA1 = list("ACDEFGHIKLMNPQRSTVWY")
-
-
-# =============================================================================
-# Low-level parsing / geometry (pure Python)
-# =============================================================================
 
 TWO_CHAR_ELEM = {"CL", "BR", "MG", "ZN", "CA", "FE", "MN",
                  "NA", "CU", "NI", "CO", "SE", "SI"}
@@ -171,11 +161,6 @@ def validate_receptor_structure(path: str, label: str = "receptor") -> Dict[str,
 
 
 def parse_ligand_poses(content: str) -> List[dict]:
-    """Parse a docked-ligand PDBQT (multi-MODEL) into a list of poses.
-
-    Each pose: {'model': int, 'score': float, 'atoms': [(name, elem, [x,y,z])]}.
-    Atom order is preserved, so two poses of the SAME ligand are index-aligned.
-    """
     poses: List[dict] = []
     cur = None
     for line in content.split("\n"):
@@ -211,15 +196,6 @@ def parse_ligand_poses(content: str) -> List[dict]:
 
 def choose_reference_ligand_pose(poses: Sequence[dict],
                                  user_supplied: bool = False) -> dict:
-    """Choose the WT reference ligand pose.
-
-    If the user provides a WT reference pose file, the first MODEL is used
-    intentionally. This lets a manually checked pose remain the reference even
-    if the file contains multiple docking models with different Vina scores.
-
-    If the pose file was generated internally by this pipeline, the lowest
-    Vina score remains the default reference.
-    """
     if not poses:
         raise ValueError("no WT reference pose parsed")
     if user_supplied:
@@ -233,16 +209,6 @@ def choose_reference_ligand_pose_ensemble(
     user_supplied: bool = False,
     n: int = DEFAULT_REFERENCE_POSE_ENSEMBLE_N,
 ) -> List[dict]:
-    """Choose WT reference poses for RMSD comparison.
-
-    User-supplied WT pose files are treated as a checked pose ensemble: the
-    first n parsed MODELs are accepted as equivalent WT-like references for
-    pose RMSD, while MODEL 1 remains the contact/score baseline.
-
-    Internally generated WT docking keeps the stricter single lowest-score
-    reference, preserving the original behavior when no external WT pose file
-    is provided.
-    """
     if not poses:
         raise ValueError("no WT reference pose parsed")
     if user_supplied:
@@ -286,13 +252,6 @@ def _heavy_atoms(pose: dict) -> List[Tuple[str, str, np.ndarray]]:
 
 def _rmsd_symmetry_safe(a: List[Tuple[str, str, np.ndarray]],
                         b: List[Tuple[str, str, np.ndarray]]) -> float:
-    """Element-wise optimal-assignment RMSD (handles symmetric atoms).
-
-    Within each element, match atoms of pose A to pose B by minimising total
-    squared distance (Hungarian via scipy if available, else greedy nearest).
-    This corrects the common symmetry problem (e.g. equivalent ring atoms or
-    two equivalent oxygens) without a full graph-isomorphism treatment.
-    """
     from collections import defaultdict
     ga, gb = defaultdict(list), defaultdict(list)
     for _, e, x in a:
@@ -330,18 +289,6 @@ def _rmsd_symmetry_safe(a: List[Tuple[str, str, np.ndarray]],
 
 def ligand_rmsd(pose_a: dict, pose_b: dict,
                 symmetry_safe: bool = False) -> float:
-    """Frame-locked heavy-atom RMSD between two poses of the SAME ligand.
-
-    No superposition: both receptors must share one coordinate frame
-    (FoldX RepairPDB / BuildModel do not recenter) and the docking box is in
-    absolute coordinates, so poses are directly comparable.
-
-    Matching strategy:
-      * symmetry_safe=True  -> element-wise optimal assignment (robust to
-        symmetric atoms and to atom-order changes).
-      * symmetry_safe=False -> match by atom name (robust to order changes);
-        falls back to index order, then to symmetry-safe, if names don't map.
-    """
     a = _heavy_atoms(pose_a)
     b = _heavy_atoms(pose_b)
     if not a or not b:
@@ -370,10 +317,39 @@ def ligand_rmsd(pose_a: dict, pose_b: dict,
     # last resort: symmetry-safe assignment
     return _rmsd_symmetry_safe(a, b)
 
+def select_envelope_representative_pose(
+        poses: Sequence[dict],
+        ref_pose_ensemble: Sequence[dict],
+        delta_e: float = 2.0,
+        symmetry_safe: bool = False) -> Tuple[Optional[dict], float]:
+   
+    if not poses:
+        return None, float("nan")
 
-# =============================================================================
-# Contact fingerprint (IFP) + clash -- reuse FuncSite-ML classification
-# =============================================================================
+    scored = [p for p in poses if p.get("score") is not None]
+    if scored:
+        best = min(p["score"] for p in scored)
+        window = [p for p in scored if p["score"] <= best + delta_e]
+        if not window:  # degenerate; should not happen but stay safe
+            window = [min(scored, key=lambda p: p["score"])]
+    else:
+        window = list(poses)
+
+    best_pose = None
+    best_rmsd = float("nan")
+    for p in window:
+        vals = [ligand_rmsd(ref, p, symmetry_safe=symmetry_safe)
+                for ref in ref_pose_ensemble]
+        vals = [v for v in vals if not np.isnan(v)]
+        if not vals:
+            continue
+        r = min(vals)
+        if np.isnan(best_rmsd) or r < best_rmsd:
+            best_rmsd, best_pose = r, p
+
+    if best_pose is None:  # no RMSD computable; keep a pose for contacts/clash
+        best_pose = window[0]
+    return best_pose, best_rmsd
 
 def compute_contacts(receptor_residues: Dict[str, dict],
                      ligand_atoms: Sequence[Tuple[str, str, List[float]]]
@@ -443,7 +419,6 @@ def compute_contacts(receptor_residues: Dict[str, dict],
 
 
 def residue_contact_weight(rec: dict) -> float:
-    """Weight a residue's WT contact by type (catalytic-relevant > hydrophobic)."""
     w = {"ionic": 1.5, "polar": 1.5, "halogen": 1.0, "hydrophobic": 0.5}
     return sum(w[t] * rec[t] for t in CONTACT_TYPES)
 
@@ -458,6 +433,23 @@ class EnvelopeConfig:
     exhaustiveness: int = 16
     num_modes: int = 10
     seed: int = 42
+    vina_cpu: int = 0                # vina --cpu per process; 0 = vina default
+                                     # (all cores). The runner caps this so that
+                                     # jobs * vina_cpu <= physical cores and the
+                                     # parallel workers never oversubscribe.
+    vina_timeout: int = 1200         # seconds per single vina docking call
+    foldx_runs: int = 1              # FoldX BuildModel numberOfRuns. Only run 0
+                                     # (_1_0.pdb) is ever docked, so >1 just
+                                     # produces never-docked extra structures.
+                                     # ddG is report-only, so a single run is
+                                     # sufficient; 1 cuts ~2/3 of BuildModel time.
+
+    # --- docking backend (CPU vina vs GPU vina; SAME Vina scoring function) ---
+    docking_backend: str = "vina-cpu"   # "vina-cpu" | "vina-gpu"
+    gpu_thread: int = 8000              # Vina-GPU --thread (docking lanes)
+    search_depth: int = 0               # Vina-GPU --search_depth; 0 = heuristic
+    opencl_binary_path: str = ""        # Vina-GPU --opencl_binary_path (kernels)
+    vina_gpu_cwd: str = ""              # cwd for Vina-GPU; "" = binary's dir
 
     # --- hard exclusion gates ---
     clash_tol: int = 0               # max NEW clashes allowed
@@ -467,6 +459,10 @@ class EnvelopeConfig:
     ddg_guard_line: float = 2.5      # reported only; not used as a hard filter
     fail_on_missing_ddg: bool = False # ddG is reported, never used to delete hits
     symmetry_safe_rmsd: bool = False # element-wise assignment for symmetric ligands
+    score_window_dE: float = 2.0     # kcal/mol: poses within this of the best
+                                     # score are score-indistinguishable; the
+                                     # representative pose is chosen by envelope
+                                     # geometry inside this window, not by rank
 
     # --- key-contact set definition on WT ---
     key_contact_min_weight: float = 1.0   # WT residue counts as "key" if >= this
@@ -482,11 +478,6 @@ class EnvelopeConfig:
 
     # --- frame-consistency sanity ---
     frame_centroid_tol: float = 1.0  # CA centroid drift WT-vs-mutant (A)
-
-
-# =============================================================================
-# Reference envelope (built once from the WT complex)
-# =============================================================================
 
 class ReferenceEnvelope:
     """The fixed WT substrate envelope: pose + key-contact set + clash baseline."""
@@ -531,11 +522,6 @@ class ReferenceEnvelope:
                     if k != mutated_residue_id}
         return dict(self.key_weights)
 
-
-# =============================================================================
-# Envelope scorer (pure Python; the scientific core of this layer)
-# =============================================================================
-
 @dataclass
 class EnvelopeResult:
     site: str
@@ -572,21 +558,16 @@ class EnvelopeScorer:
                                   float("nan"), 999, float("inf"),
                                   ddg_guard, ["no_pose"])
 
-        # use the best-scoring mutant pose as the representative
-        mut_pose = min(
-            (p for p in mutant_poses if p.get("score") is not None),
-            key=lambda p: p["score"], default=mutant_poses[0])
+        mut_pose, rmsd = select_envelope_representative_pose(
+            mutant_poses, self.ref.ligand_pose_ensemble,
+            delta_e=cfg.score_window_dE,
+            symmetry_safe=cfg.symmetry_safe_rmsd)
+        if mut_pose is None:
+            return EnvelopeResult(site, target_aa, False, 0.0, 0.0,
+                                  float("nan"), 999, float("inf"),
+                                  ddg_guard, ["no_pose"])
 
-        # --- pose RMSD vs WT reference ensemble (frame-locked) ---
-        rmsd_values = [
-            ligand_rmsd(ref_pose, mut_pose,
-                        symmetry_safe=cfg.symmetry_safe_rmsd)
-            for ref_pose in self.ref.ligand_pose_ensemble
-        ]
-        rmsd_values = [v for v in rmsd_values if not np.isnan(v)]
-        rmsd = min(rmsd_values) if rmsd_values else float("nan")
-
-        # --- contacts on the mutant pose ---
+        # --- contacts on the representative pose ---
         mut_ifp, mut_clash = compute_contacts(mutant_receptor, mut_pose["atoms"])
 
         # --- key-contact retention (rest-of-pocket must keep gripping) ---
@@ -654,11 +635,7 @@ class EnvelopeScorer:
 
 def _run(cmd, cwd: Optional[str], timeout: int, what: str,
          log_dir: Optional[str] = None):
-    """Run an external command, capture output, fail loudly on error.
 
-    Raises RuntimeError with the stderr tail when the command returns non-zero
-    or times out. Writes full stdout/stderr to <log_dir>/<what>.log if given.
-    """
     try:
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
                               timeout=timeout,
@@ -679,13 +656,9 @@ def _run(cmd, cwd: Optional[str], timeout: int, what: str,
     return proc
 
 class FoldXMutator:
-    """RepairPDB once, then BuildModel per single-point mutation (out-pdb=true).
-
-    Reuses the proven RepairPDB -> BuildModel flow; ddG is taken as a GUARD.
-    """
 
     def __init__(self, foldx_bin: str, repaired_pdb: str, work_root: str,
-                 number_of_runs: int = 3, timeout: int = 600):
+                 number_of_runs: int = 1, timeout: int = 600):
         self.foldx_bin = foldx_bin
         self.repaired_pdb = repaired_pdb
         self.repaired_name = os.path.basename(repaired_pdb)
@@ -845,11 +818,30 @@ class LockedBoxDocker:
         self.vina_bin = vina_bin
         self.box = box
         self.config = config
-        self.timeout = timeout
+        # per-call vina timeout: config value wins, else the constructor default
+        self.timeout = getattr(config, "vina_timeout", 0) or timeout
         self.log_dir = log_dir
 
     def dock(self, receptor_pdbqt: str, ligand_pdbqt: str,
              out_pdbqt: str) -> List[dict]:
+        """Dock the ligand into one receptor; return parsed poses.
+
+        Backend is chosen by config.docking_backend:
+          * "vina-cpu" (default) -> AutoDock Vina 1.2.x CLI (unchanged).
+          * "vina-gpu"           -> AutoDock-Vina-GPU 2.1 (OpenCL), same Vina
+                                    scoring function, so poses/box/score stay
+                                    comparable and all downstream FuncKeep logic
+                                    is unaffected. GPU search is stochastic and
+                                    ignores --seed; rmsd_cap is auto-recalibrated
+                                    each run under whichever backend is active.
+        """
+        backend = getattr(self.config, "docking_backend", "vina-cpu")
+        if backend == "vina-gpu":
+            return self._dock_vina_gpu(receptor_pdbqt, ligand_pdbqt, out_pdbqt)
+        return self._dock_vina_cpu(receptor_pdbqt, ligand_pdbqt, out_pdbqt)
+
+    def _dock_vina_cpu(self, receptor_pdbqt: str, ligand_pdbqt: str,
+                       out_pdbqt: str) -> List[dict]:
         cfg = self.config
         cmd = [
             self.vina_bin,
@@ -866,11 +858,93 @@ class LockedBoxDocker:
             "--seed", str(cfg.seed),
             "--out", out_pdbqt,
         ]
+        # pin thread count per process; without this each parallel worker grabs
+        # all cores (vina default) and jobs*cores threads thrash the CPU.
+        if getattr(cfg, "vina_cpu", 0) and cfg.vina_cpu > 0:
+            cmd += ["--cpu", str(cfg.vina_cpu)]
         tag = f"vina_{Path(receptor_pdbqt).stem}"
         _run(cmd, cwd=None, timeout=self.timeout, what=tag, log_dir=self.log_dir)
         if not os.path.exists(out_pdbqt):
             raise RuntimeError(f"vina returned 0 but produced no out: {out_pdbqt}")
         with open(out_pdbqt) as f:
+            return parse_ligand_poses(f.read())
+
+    def _dock_vina_gpu(self, receptor_pdbqt: str, ligand_pdbqt: str,
+                       out_pdbqt: str) -> List[dict]:
+        """AutoDock-Vina-GPU 2.1 backend (config-file + ligand_directory mode).
+
+        Vina-GPU 2.1 has no --exhaustiveness/--seed/--cpu and no single --out;
+        it reads a directory of ligands and writes results into another
+        directory. We therefore stage the one substrate into its own input dir,
+        run, then copy the produced pose file to the path the caller expects.
+
+        Reproducibility note: GPU sampling is stochastic (score jitter ~0.1-0.5
+        kcal/mol per run). That is well inside the ΔE energy window and the
+        per-seed calibration spread, so the representative-pose selection and
+        rmsd_cap calibration absorb it; do NOT carry over a CPU-calibrated cap.
+        """
+        cfg = self.config
+        out_abs = os.path.abspath(out_pdbqt)
+        work = os.path.join(os.path.dirname(out_abs) or ".",
+                            f"gpu_{Path(out_pdbqt).stem}")
+        lig_dir = os.path.join(work, "in")
+        res_dir = os.path.join(work, "out")
+        for d in (lig_dir, res_dir):
+            shutil.rmtree(d, ignore_errors=True)
+            os.makedirs(d, exist_ok=True)
+        shutil.copy2(ligand_pdbqt, os.path.join(lig_dir, Path(ligand_pdbqt).name))
+
+        conf = os.path.join(work, "vina_gpu.conf")
+        lines = [
+            f"receptor = {os.path.abspath(receptor_pdbqt)}",
+            f"ligand_directory = {os.path.abspath(lig_dir)}",
+            f"output_directory = {os.path.abspath(res_dir)}",
+            f"center_x = {self.box['center_x']}",
+            f"center_y = {self.box['center_y']}",
+            f"center_z = {self.box['center_z']}",
+            f"size_x = {self.box['size_x']}",
+            f"size_y = {self.box['size_y']}",
+            f"size_z = {self.box['size_z']}",
+            f"thread = {int(getattr(cfg, 'gpu_thread', 8000) or 8000)}",
+            # CPU/GPU parity: the representative-pose energy window needs several
+            # poses to choose from, exactly as the vina-cpu path (num_modes=10).
+            # num_modes is a standard Vina arg and is honoured by Vina-GPU 2.1.
+            f"num_modes = {int(getattr(cfg, 'num_modes', 10) or 10)}",
+        ]
+        sd = int(getattr(cfg, "search_depth", 0) or 0)
+        if sd > 0:
+            lines.append(f"search_depth = {sd}")
+        ocl = getattr(cfg, "opencl_binary_path", "") or ""
+        if ocl:
+            lines.append(f"opencl_binary_path = {os.path.abspath(ocl)}")
+        # Vina-GPU's own per-pose score/timing log: the primary evidence for the
+        # WT self-recovery diagnosis (sampling miss vs scoring mis-ranking).
+        gpu_log = os.path.join(work, "vina_gpu.log")
+        lines.append(f"log = {os.path.abspath(gpu_log)}")
+        with open(conf, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        # cwd defaults to the binary's dir so the OpenCL kernel .bin files (built
+        # next to the executable) resolve even when opencl_binary_path is unset.
+        run_cwd = (getattr(cfg, "vina_gpu_cwd", "") or None)
+        if run_cwd is None and os.path.dirname(self.vina_bin):
+            run_cwd = os.path.dirname(os.path.abspath(self.vina_bin))
+
+        tag = f"vinagpu_{Path(receptor_pdbqt).stem}"
+        _run([self.vina_bin, "--config", conf], cwd=run_cwd,
+             timeout=self.timeout, what=tag, log_dir=self.log_dir)
+
+        # defensive output discovery across Vina-GPU build variants
+        produced = (sorted(glob.glob(os.path.join(res_dir, "*.pdbqt")))
+                    or sorted(glob.glob(os.path.join(lig_dir, "*_out.pdbqt")))
+                    or sorted(glob.glob(os.path.join(work, "**", "*_out.pdbqt"),
+                                        recursive=True)))
+        if not produced:
+            raise RuntimeError(
+                f"Vina-GPU produced no output pdbqt under {res_dir} "
+                f"(check opencl_binary_path / kernel build and the run log)")
+        shutil.copy2(produced[0], out_abs)
+        with open(out_abs) as f:
             return parse_ligand_poses(f.read())
 
 
@@ -1058,23 +1132,9 @@ def run_pipeline(residue_features: pd.DataFrame,
                  config: Optional[EnvelopeConfig] = None,
                  sites: Optional[Sequence[str]] = None,
                  select_kwargs: Optional[dict] = None,
+                 prerepaired_wt_pdb: Optional[str] = None,
                  wt_reference_structure: Optional[str] = None) -> pd.DataFrame:
-    """One call: FuncSite-ML scores in, (sites + mutation screen) table out.
 
-    residue_features : FuncSite-ML output (residue_id, catalytic_prob,
-                       specificity_prob, ...).
-    ligand_pdbqt     : substrate ligand to re-dock into every mutant.
-    box              : locked WT MultiOpt box (center_/size_).
-    wt_pdb_for_foldx : WT structure in PDB for FoldX RepairPDB/BuildModel.
-    wt_ligand_pose_pdbqt: optional WT docked substrate pose PDBQT. If provided,
-                       the first parsed pose is used as the contact/score
-                       reference and the first 5 poses are used as an RMSD
-                       reference ensemble. If omitted, it is generated by
-                       docking ligand_pdbqt into the WT receptor prepared from
-                       FoldX-repaired WT PDB, and the lowest-score pose is used.
-    wt_reference_structure: optional clean WT PDB/PDBQT used only for
-                       reference contacts. Defaults to FoldX-repaired WT PDB.
-    """
     config = config or EnvelopeConfig()
     os.makedirs(work_dir, exist_ok=True)
 
@@ -1086,7 +1146,11 @@ def run_pipeline(residue_features: pd.DataFrame,
         raise ValueError("no candidate sites selected; relax select_kwargs")
 
     # 2) external tools and WT receptor preparation
-    repaired = FoldXMutator.repair(foldx_bin, wt_pdb_for_foldx, work_dir)
+    if prerepaired_wt_pdb and os.path.exists(prerepaired_wt_pdb):
+        repaired = prerepaired_wt_pdb   # reuse one shared repair: faster and
+                                        # keeps every shard on an identical WT
+    else:
+        repaired = FoldXMutator.repair(foldx_bin, wt_pdb_for_foldx, work_dir)
     wt_receptor_pdbqt = converter.convert(
         repaired, os.path.join(work_dir, "wt_receptor.pdbqt"))
 
@@ -1113,7 +1177,8 @@ def run_pipeline(residue_features: pd.DataFrame,
         wt_receptor, wt_ref_pose, config, weight_map,
         ligand_pose_ensemble=wt_ref_pose_ensemble)
 
-    mutator = FoldXMutator(foldx_bin, repaired, os.path.join(work_dir, "foldx"))
+    mutator = FoldXMutator(foldx_bin, repaired, os.path.join(work_dir, "foldx"),
+                           number_of_runs=getattr(config, "foldx_runs", 1))
 
     # 3) screen
     flt = EnvelopeFilter(reference, config, mutator, converter, docker,
@@ -1127,11 +1192,6 @@ def run_pipeline(residue_features: pd.DataFrame,
         fs = residue_features[keep].rename(columns={"residue_id": "site"})
         result = result.merge(fs, on="site", how="left")
     return result
-
-
-# =============================================================================
-# Self-test: pure-Python geometry / IFP / scoring (no FoldX / Vina needed)
-# =============================================================================
 
 def _atom_line(rec: str, serial: int, aname: str, rname: str, chain: str,
                rseq: int, x: float, y: float, z: float) -> str:
@@ -1282,6 +1342,23 @@ def _build_cli():
                         "does not delete candidates")
     p.add_argument("--exhaustiveness", type=int)
     p.add_argument("--seed", type=int)
+    p.add_argument("--cpu", type=int, default=None,
+                   help="vina --cpu per process (unset/0 = all cores)")
+    p.add_argument("--vina-timeout", type=int, default=None,
+                   help="seconds per vina docking call")
+    p.add_argument("--docking-backend", choices=("vina-cpu", "vina-gpu"),
+                   default=None, help="docking engine (same Vina scoring fn)")
+    p.add_argument("--gpu-thread", type=int, default=None,
+                   help="Vina-GPU --thread (docking lanes), e.g. 8000")
+    p.add_argument("--search-depth", type=int, default=None,
+                   help="Vina-GPU --search_depth (0/unset = heuristic)")
+    p.add_argument("--opencl-binary-path", default=None,
+                   help="Vina-GPU --opencl_binary_path (OpenCL kernel dir)")
+    p.add_argument("--vina-gpu-cwd", default=None,
+                   help="working dir for Vina-GPU (default: the binary's dir)")
+    p.add_argument("--foldx-runs", type=int, default=None,
+                   help="FoldX BuildModel numberOfRuns (default 1; only run 0 "
+                        "is docked, ddG is report-only)")
     p.add_argument("--symmetry-safe-rmsd", action="store_true")
     p.add_argument("--allow-missing-ddg", action="store_true",
                    help="kept for compatibility; missing ddG is reported only")
@@ -1312,6 +1389,22 @@ def _cli_main():
             setattr(cfg, attr, v)
     if args.symmetry_safe_rmsd:
         cfg.symmetry_safe_rmsd = True
+    if getattr(args, "cpu", None) is not None:
+        cfg.vina_cpu = args.cpu
+    if getattr(args, "vina_timeout", None) is not None:
+        cfg.vina_timeout = args.vina_timeout
+    if getattr(args, "docking_backend", None) is not None:
+        cfg.docking_backend = args.docking_backend
+    if getattr(args, "gpu_thread", None) is not None:
+        cfg.gpu_thread = args.gpu_thread
+    if getattr(args, "search_depth", None) is not None:
+        cfg.search_depth = args.search_depth
+    if getattr(args, "opencl_binary_path", None) is not None:
+        cfg.opencl_binary_path = args.opencl_binary_path
+    if getattr(args, "vina_gpu_cwd", None) is not None:
+        cfg.vina_gpu_cwd = args.vina_gpu_cwd
+    if getattr(args, "foldx_runs", None) is not None:
+        cfg.foldx_runs = args.foldx_runs
     if args.allow_missing_ddg:
         cfg.fail_on_missing_ddg = False
 
@@ -1351,7 +1444,6 @@ def _cli_main():
     df.to_csv(args.out, index=False)
     n_keep = int(df["survived"].sum()) if not df.empty else 0
     print(f"wrote {args.out}: {len(df)} mutations, {n_keep} survived")
-
 
 if __name__ == "__main__":
     _cli_main()
