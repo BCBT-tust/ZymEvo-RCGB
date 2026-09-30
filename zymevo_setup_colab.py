@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-ZymEvo Environment Setup Script
-Tianjin University of Science and Technology
-Research Center for Green BioManufacturing
-Automated installation of enzyme evolution tools for Google Colab (Ubuntu Linux)
-"""
 
 import os
 import sys
@@ -22,8 +16,15 @@ PREPARE_RECEPTOR = f"{MGLTOOLS_DIR}/MGLToolsPckgs/AutoDockTools/Utilities24/prep
 PREPARE_LIGAND = f"{MGLTOOLS_DIR}/MGLToolsPckgs/AutoDockTools/Utilities24/prepare_ligand4.py"
 PYTHONSH_PATH = f"{MGLTOOLS_DIR}/bin/pythonsh"
 
+# Miniconda is installed into /usr/local; Python 2.7 lives in its own env.
+CONDA_BIN = "/usr/local/bin/conda"
+PY27_ENV = "/usr/local/envs/py27"
+PY27_BIN = f"{PY27_ENV}/bin/python2.7"
+PIP2_BIN = f"{PY27_ENV}/bin/pip"
+
 # Scripps server has an SSL SAN mismatch; --no-check-certificate is required.
 WGET_OPTS = "--no-check-certificate -q"
+
 
 def print_status(message, status="info"):
     colors = {
@@ -62,6 +63,45 @@ def run_cmd(command, description=None, check=True):
     if check:
         raise RuntimeError(f"Command failed: {command}\n{err_tail}")
     return result
+
+
+def install_python27():
+    """Create a conda env with Python 2.7 + numpy.
+
+    Ubuntu 24.04 (current Colab) removed python2.7 from apt, so conda is used.
+    conda-forge is tried first (no Terms-of-Service prompt); if that fails,
+    fall back to Anaconda's default channel after accepting its ToS.
+    """
+    if os.path.exists(PY27_BIN):
+        print_status("Python 2.7 conda env already exists", "success")
+    else:
+        r = run_cmd(
+            f"{CONDA_BIN} create -y -q -p {PY27_ENV} "
+            f"--override-channels -c conda-forge python=2.7 numpy=1.16 pip",
+            "Creating Python 2.7 env (conda-forge)",
+            check=False,
+        )
+        if r.returncode != 0 or not os.path.exists(PY27_BIN):
+            print_status("conda-forge failed, trying Anaconda defaults channel", "warning")
+            run_cmd(
+                f"{CONDA_BIN} tos accept --override-channels "
+                f"--channel https://repo.anaconda.com/pkgs/main "
+                f"--channel https://repo.anaconda.com/pkgs/r",
+                check=False,
+            )
+            run_cmd(
+                f"{CONDA_BIN} create -y -q -p {PY27_ENV} "
+                f"--override-channels -c defaults python=2.7 numpy=1.16 pip",
+                "Creating Python 2.7 env (defaults)",
+            )
+
+    if not os.path.exists(PY27_BIN):
+        raise RuntimeError(f"Python 2.7 not found at {PY27_BIN}")
+
+    # Compatibility links so later notebook cells that call `python2.7` / `pip2`
+    # directly keep working.
+    run_cmd(f"ln -sf {PY27_BIN} /usr/local/bin/python2.7", check=True)
+    run_cmd(f"ln -sf {PIP2_BIN} /usr/local/bin/pip2", check=True)
 
 
 def install_mgltools():
@@ -110,10 +150,19 @@ def install_mgltools():
 
 
 def configure_pythonsh():
-    """Create the pythonsh wrapper that routes AutoDockTools scripts to Python 2.7."""
+    """Create the pythonsh wrapper that routes AutoDockTools scripts to Python 2.7.
+
+    PYTHONPATH is set inside the wrapper so it works even if the notebook's
+    environment variables are lost (e.g. when called via subprocess).
+    """
     os.makedirs(os.path.dirname(PYTHONSH_PATH), exist_ok=True)
     with open(PYTHONSH_PATH, "w") as f:
-        f.write("#!/bin/bash\n/usr/bin/python2.7 \"$@\"\n")
+        f.write(
+            "#!/bin/bash\n"
+            f"export PYTHONPATH=\"{MGLTOOLS_DIR}/MGLToolsPckgs\"\n"
+            "unset PYTHONHOME\n"
+            f"exec \"{PY27_BIN}\" \"$@\"\n"
+        )
     os.chmod(PYTHONSH_PATH, 0o755)
 
 
@@ -130,7 +179,7 @@ def main():
 
     try:
         print_status("Step 1/6: Installing Miniconda")
-        if not os.path.exists("/usr/local/bin/conda"):
+        if not os.path.exists(CONDA_BIN):
             run_cmd(
                 f"wget {WGET_OPTS} "
                 "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh",
@@ -144,20 +193,16 @@ def main():
             print_status("Miniconda already installed", "success")
         os.environ["PATH"] = "/usr/local/bin:" + os.environ["PATH"]
 
-        print_status("Step 2/6: Installing Python 2.7 and pip2")
+        print_status("Step 2/6: Installing Python 2.7 (conda env) and csh")
         run_cmd(
-            "apt-get update -qq && apt-get install -y python2.7 csh",
-            "Installing Python 2.7 and csh",
+            "apt-get update -qq; apt-get install -y -qq csh",
+            "Installing csh",
         )
-        run_cmd(
-            "curl -sk https://bootstrap.pypa.io/pip/2.7/get-pip.py | python2.7",
-            "Installing pip2",
-        )
-        run_cmd("pip2 install numpy", "Installing numpy for Python 2.7")
+        install_python27()
 
         print_status("Step 3/6: Installing OpenBabel")
         run_cmd(
-            "apt-get install -y openbabel python3-openbabel",
+            "apt-get install -y -qq openbabel python3-openbabel",
             "Installing OpenBabel via apt-get",
         )
 
@@ -176,18 +221,25 @@ def main():
 
     print_status("Verifying installation...")
     checks = {
-        "Python 2.7":          "python2.7 --version",
-        "pip2":                "pip2 --version",
-        "OpenBabel":           "obabel -V",
-        "pythonsh":            f"test -x {PYTHONSH_PATH} && echo 'OK'",
+        "Python 2.7":           "python2.7 --version",
+        "pip2":                 "pip2 --version",
+        "OpenBabel":            "obabel -V",
+        "pythonsh":             f"test -x {PYTHONSH_PATH} && echo 'OK'",
         "prepare_receptor4.py": f"test -f {PREPARE_RECEPTOR} && echo 'OK'",
         "prepare_ligand4.py":   f"test -f {PREPARE_LIGAND} && echo 'OK'",
+        # Functional test: the scripts' imports actually load under Python 2.7.
+        "AutoDockTools import": (
+            f"{PYTHONSH_PATH} -c "
+            "\"import numpy, MolKit, AutoDockTools.MoleculePreparation; print('OK')\""
+        ),
     }
 
     results = []
     for name, cmd in checks.items():
-        result = subprocess.run(cmd, shell=True, capture_output=True)
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         ok = result.returncode == 0
+        if not ok:
+            print_status(f"{name} check failed: {(result.stderr or '').strip()[-300:]}", "error")
         results.append((name, "✓" if ok else "✗", "#4CAF50" if ok else "#F44336"))
 
     html = """
@@ -239,6 +291,7 @@ def main():
     print("✓ ZymEvo Environment Variables:")
     print("=" * 60)
     print(f"PYTHONPATH:        {os.environ.get('PYTHONPATH')}")
+    print(f"python2.7:         {PY27_BIN}")
     print(f"pythonsh:          {PYTHONSH_PATH}")
     print(f"prepare_receptor4: {PREPARE_RECEPTOR}")
     print(f"prepare_ligand4:   {PREPARE_LIGAND}")
