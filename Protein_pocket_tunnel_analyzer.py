@@ -175,17 +175,41 @@ class ProteinAnalyzer:
             out.add((chain or None, num))
         return out
 
+    @staticmethod
+    def load_active_site_file(path) -> Dict[str, object]:
+        """Read a per-structure active-site file.
+        .json : {"stem": "84,153"} or {"stem": ["A:84", 153]} or
+                {"stem": {"resids": [...], ...}} (anchors.json style)
+        .csv  : columns structure,residues   e.g.  WT,"84,153,224"
+        """
+        path = Path(path)
+        if path.suffix.lower() == ".json":
+            with open(path) as f:
+                return json.load(f)
+        if path.suffix.lower() == ".csv":
+            df = pd.read_csv(path, dtype=str)
+            cols = {c.lower().strip(): c for c in df.columns}
+            s, r = cols.get("structure"), cols.get("residues")
+            if not s or not r:
+                raise ValueError(f"{path.name}: needs columns 'structure' and 'residues'")
+            return {str(a).strip(): str(b) for a, b in zip(df[s], df[r]) if str(b).strip() not in ("", "nan")}
+        raise ValueError(f"Unsupported active-site file: {path.name} (use .json or .csv)")
+
     def _active_site_for(self, active_site_resids: ActiveSiteSpec, stem: str) -> Set[Tuple[Optional[str], str]]:
         """Active-site residues for one structure, from a global string, a per-stem
-        dict, or a JSON file of such a dict."""
+        dict, or a JSON/CSV file of such a dict. 'auto' and '' mean "none given"."""
         spec = active_site_resids
-        if isinstance(spec, (str, Path)) and str(spec).lower().endswith(".json") and Path(spec).exists():
-            with open(spec) as f:
-                spec = json.load(f)
+        if isinstance(spec, (str, Path)) and str(spec).lower().endswith((".json", ".csv")) and Path(spec).exists():
+            spec = self.load_active_site_file(spec)
         if isinstance(spec, dict):
             for key in (stem, self._stem_alias.get(stem), "*"):
                 if key is not None and key in spec:
-                    return self._parse_residue_tokens(spec[key])
+                    val = spec[key]
+                    if isinstance(val, dict):
+                        val = val.get("resids", val.get("residues", ""))
+                    return self._parse_residue_tokens(val)
+            return set()
+        if isinstance(spec, str) and spec.strip().lower() == "auto":
             return set()
         return self._parse_residue_tokens(spec)
 
@@ -194,6 +218,258 @@ class ProteinAnalyzer:
         """resid includes insertion code ('84', '84A'); match is exact."""
         resid = resid.strip().upper()
         return any(resid == num and (c is None or c == chain) for c, num in targets)
+
+    # ==================================================================
+    # Active-site auto-detection (used when no residues are supplied)
+    # ==================================================================
+    # Evidence is tried in order of reliability; every candidate is kept so the
+    # choice can be reviewed (active_sites_auto.json):
+    #   ligand      residues within 4.5 A of a bound ligand (holo / docked input)
+    #   metal       protein donors coordinating a metal ion
+    #   motif       catalytic constellations found geometrically or by sequence
+    #               (MOTIF_PRIORITY below; extend it for other enzyme families)
+    #   (none)      engine falls back to P2Rank's top pocket, flagged as warning
+    # Within a tier, candidates lying in a better-ranked P2Rank pocket and with
+    # higher model confidence (pLDDT in the B-factor column) are preferred.
+    WATERS = {"HOH", "WAT", "DOD", "H2O", "SOL", "TIP", "TIP3"}
+    METAL_ELEMENTS = {"ZN", "MG", "CA", "MN", "FE", "CO", "NI", "CU", "CD", "NA", "K"}
+    # crystallisation additives / buffers that are not substrates
+    ADDITIVES = {"SO4", "PO4", "GOL", "EDO", "PEG", "PG4", "PGE", "1PE", "ACT", "ACY", "MPD",
+                 "DMS", "FMT", "TRS", "BME", "IOD", "CL", "BR", "NO3", "EPE", "MES", "CIT",
+                 "IPA", "EOH", "MOH", "NH4", "SCN", "AZI", "IMD", "TLA", "BOG", "LDA"}
+    # donor atoms that can coordinate a metal (Asn ND2 / Gln NE2 are amide N: excluded)
+    METAL_DONORS = {("HIS", "ND1"), ("HIS", "NE2"), ("ASP", "OD1"), ("ASP", "OD2"),
+                    ("GLU", "OE1"), ("GLU", "OE2"), ("CYS", "SG"), ("ASN", "OD1"),
+                    ("GLN", "OE1"), ("SER", "OG"), ("THR", "OG1"), ("TYR", "OH"), ("MET", "SD")}
+    MOTIF_PRIORITY = {
+        # name                      base score   what it marks
+        "Ser/Cys-His-Asp/Glu triad": 70,        # serine/cysteine hydrolases, proteases, lipases
+        "HKD x2":                    68,        # PLD superfamily, cardiolipin synthases, nucleases
+        "HKD x1":                    50,
+        "GxSxG nucleophile + acid":  45,        # patatin-like / alpha-beta hydrolase without His in range
+        "Ser-Asp/Glu H-bonded dyad": 40,        # patatin / SGNH-type dyads; common by chance, so only
+                                                # accepted inside a top-3 P2Rank pocket
+    }
+    DYAD_MAX_POCKET_RANK = 3
+    TIER_SCORE = {"ligand": 90, "metal": 60}
+
+    def _read_atoms(self, pdb_file) -> List[Dict]:
+        atoms = []
+        with open(pdb_file, "r", errors="ignore") as f:
+            for line in f:
+                if line.startswith("ENDMDL"):
+                    break
+                if not line.startswith(("ATOM", "HETATM")):
+                    continue
+                name = line[12:16].strip()
+                el = (line[76:78].strip() or re.sub(r"[^A-Za-z]", "", name)[:1]).upper()
+                if el in ("H", "D"):
+                    continue
+                try:
+                    b = float(line[60:66])
+                except ValueError:
+                    b = float("nan")
+                atoms.append(dict(het=line.startswith("HETATM"), name=name, resn=line[17:20].strip(),
+                                  chain=line[21].strip(),
+                                  resid=(line[22:26].strip() + line[26].strip()).upper(),
+                                  el=el, b=b,
+                                  xyz=(float(line[30:38]), float(line[38:46]), float(line[46:54]))))
+        return atoms
+
+    @staticmethod
+    def _dist(a, b) -> float:
+        return sum((a[k] - b[k]) ** 2 for k in range(3)) ** 0.5
+
+    @staticmethod
+    def _looks_like_plddt(atoms) -> bool:
+        bs = [a["b"] for a in atoms if not a["het"] and a["b"] == a["b"]]
+        return bool(bs) and min(bs) >= 0 and max(bs) <= 100 and sum(b > 50 for b in bs) > 0.5 * len(bs)
+
+    def _detect_ligand_sites(self, atoms) -> List[Dict]:
+        groups: Dict[Tuple, List[Dict]] = {}
+        for a in atoms:
+            if a["het"] and a["resn"] not in self.WATERS and a["resn"] not in self.ADDITIVES \
+                    and a["el"] not in self.METAL_ELEMENTS:
+                groups.setdefault((a["chain"], a["resid"], a["resn"]), []).append(a)
+        prot = [a for a in atoms if not a["het"]]
+        out = []
+        for (ch, ri, rn), lig in groups.items():
+            if len(lig) < 6:                      # too small to define a binding site
+                continue
+            near = {(p["chain"], p["resid"]) for p in prot
+                    if min(self._dist(p["xyz"], l["xyz"]) for l in lig) <= 4.5}
+            if near:
+                out.append(dict(source="ligand", name=f"ligand {rn} {ch}:{ri} ({len(lig)} heavy atoms)",
+                                residues=sorted(near), score=self.TIER_SCORE["ligand"] + min(len(lig), 60) / 10))
+        return out
+
+    def _detect_metal_sites(self, atoms) -> List[Dict]:
+        out = []
+        donors = [a for a in atoms if not a["het"] and (a["resn"], a["name"]) in self.METAL_DONORS]
+        for m in atoms:
+            if not (m["het"] and m["el"] in self.METAL_ELEMENTS and m["el"] not in ("NA", "K")):
+                continue
+            cut = 3.0 if m["el"] in ("CA", "MG") else 2.8
+            lig = {(d["chain"], d["resid"]): d["resn"] for d in donors if self._dist(d["xyz"], m["xyz"]) <= cut}
+            if len(lig) >= 2:
+                out.append(dict(source="metal", name=f"{m['el']} {m['chain']}:{m['resid']} site, {len(lig)} protein donors",
+                                residues=sorted(lig), score=self.TIER_SCORE["metal"] + len(lig)))
+        return out
+
+    @staticmethod
+    def _chain_sequences(atoms) -> Dict[str, List[Tuple[str, str]]]:
+        """chain -> [(resid, one-letter)] in file order, from CA atoms."""
+        three = {"ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q", "GLU": "E",
+                 "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F",
+                 "PRO": "P", "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V"}
+        seqs: Dict[str, List[Tuple[str, str]]] = {}
+        for a in atoms:
+            if not a["het"] and a["name"] == "CA":
+                seqs.setdefault(a["chain"], []).append((a["resid"], three.get(a["resn"], "X")))
+        return seqs
+
+    def _detect_motifs(self, atoms) -> List[Dict]:
+        prot = [a for a in atoms if not a["het"]]
+        by_res: Dict[Tuple[str, str], Dict[str, Dict]] = {}
+        for a in prot:
+            by_res.setdefault((a["chain"], a["resid"]), {})[a["name"]] = a
+        resn = {k: next(iter(v.values()))["resn"] for k, v in by_res.items()}
+        his_n = [(k, v[n]) for k, v in by_res.items() if resn[k] == "HIS" for n in ("ND1", "NE2") if n in v]
+        acid_o = [(k, v[n]) for k, v in by_res.items() for n in ("OD1", "OD2", "OE1", "OE2")
+                  if n in v and resn[k] in ("ASP", "GLU")]
+        out = []
+
+        # 1) Ser/Cys - His - Asp/Glu triad (geometry only, sequence-order free)
+        for k, v in by_res.items():
+            nu = v.get("OG") if resn[k] == "SER" else v.get("SG") if resn[k] == "CYS" else None
+            if nu is None:
+                continue
+            cut1 = 4.0 if resn[k] == "SER" else 4.3
+            for hk, hn in his_n:
+                d1 = self._dist(nu["xyz"], hn["xyz"])
+                if d1 > cut1:
+                    continue
+                other = by_res[hk].get("ND1" if hn["name"] == "NE2" else "NE2")
+                if other is None:
+                    continue
+                best = min(((self._dist(other["xyz"], o["xyz"]), ak) for ak, o in acid_o), default=None)
+                if best and best[0] <= 3.6:
+                    d2, ak = best
+                    out.append(dict(source="motif", name="Ser/Cys-His-Asp/Glu triad",
+                                    residues=sorted({k, hk, ak}),
+                                    detail=f"{resn[k]}{k[1]}-{hn['name']}:{d1:.2f} A, HIS{hk[1]}-{resn[ak]}{ak[1]}:{d2:.2f} A",
+                                    score=self.MOTIF_PRIORITY["Ser/Cys-His-Asp/Glu triad"] - (d1 + d2)))
+
+        seqs = self._chain_sequences(atoms)
+        triad_ser = {r for c in out for r in c["residues"] if resn.get(r) in ("SER", "CYS")}
+        for ch, seq in seqs.items():
+            s = "".join(x for _, x in seq)
+            # 2) HKD motif(s): H-x-K-x(4)-D
+            hkd = [m.start() for m in re.finditer(r"(?=H.K....D)", s)]
+            if hkd:
+                his = [(ch, seq[i][0]) for i in hkd]
+                hits = [(ch, seq[i + j][0]) for i in hkd for j in (0, 2, 7)]
+                name = "HKD x2" if len(hkd) >= 2 else "HKD x1"
+                detail = "HxK(x4)D at " + ", ".join(f"H{seq[i][0]}" for i in hkd)
+                if len(hkd) >= 2:
+                    ne = [by_res[h].get("NE2") for h in his[:2]]
+                    if all(ne):
+                        detail += f"; His-His NE2 {self._dist(ne[0]['xyz'], ne[1]['xyz']):.1f} A"
+                out.append(dict(source="motif", name=name, residues=sorted(set(hits)), detail=detail,
+                                score=self.MOTIF_PRIORITY[name]))
+            # 3) GxSxG nucleophile elbow whose Ser has no His partner: nearest acid
+            for m in re.finditer(r"(?=G.S.G)", s):
+                sk = (ch, seq[m.start() + 2][0])
+                og = by_res.get(sk, {}).get("OG")
+                if og is None or sk in triad_ser:
+                    continue
+                best = min(((self._dist(og["xyz"], o["xyz"]), ak) for ak, o in acid_o), default=None)
+                if best and best[0] <= 7.0:
+                    out.append(dict(source="motif", name="GxSxG nucleophile + acid",
+                                    residues=sorted({sk, best[1]}),
+                                    detail=f"GxSxG Ser{sk[1]}, nearest {resn[best[1]]}{best[1][1]} carboxylate {best[0]:.2f} A",
+                                    score=self.MOTIF_PRIORITY["GxSxG nucleophile + acid"] - best[0] / 2))
+
+        # 4) Ser OG directly H-bonded to an Asp/Glu carboxylate (<= 3.2 A). Frequent by
+        #    chance, so detect_active_sites() keeps it only inside a top-ranked P2Rank pocket.
+        claimed = {r for c in out for r in c["residues"]}
+        for k, v in by_res.items():
+            og = v.get("OG") if resn[k] == "SER" else None
+            if og is None or k in claimed:
+                continue
+            best = min(((self._dist(og["xyz"], o["xyz"]), ak) for ak, o in acid_o), default=None)
+            if best and best[0] <= 3.2:
+                out.append(dict(source="motif", name="Ser-Asp/Glu H-bonded dyad", requires_pocket=True,
+                                residues=sorted({k, best[1]}),
+                                detail=f"SER{k[1]} OG - {resn[best[1]]}{best[1][1]} {best[0]:.2f} A",
+                                score=self.MOTIF_PRIORITY["Ser-Asp/Glu H-bonded dyad"] - best[0]))
+        return out
+
+    def detect_active_sites(self, pdb_files, p2rank_results: Optional[Dict[str, Dict]] = None,
+                            given: ActiveSiteSpec = "") -> Dict[str, Dict]:
+        """
+        For every structure without user-supplied residues, collect candidate
+        active sites and pick one. Returns stem -> record with keys
+          resids      "A:125,A:181,A:214"   (empty if nothing found)
+          source      user | ligand | metal | motif | none
+          name, detail, confidence (high/medium/low), plddt_mean,
+          p2rank_rank (best P2Rank pocket containing a candidate residue),
+          alternatives  the other candidates, best first
+        """
+        p2rank_results = p2rank_results or {}
+        report: Dict[str, Dict] = {}
+        for pdb in pdb_files:
+            pdb = Path(pdb)
+            stem = pdb.stem
+            user = self._active_site_for(given, stem)
+            if user:
+                report[stem] = dict(resids=",".join(f"{c + ':' if c else ''}{n}" for c, n in sorted(
+                    user, key=lambda t: (t[0] or "", t[1]))), source="user", name="supplied",
+                    confidence="user", detail="", alternatives=[])
+                continue
+            atoms = self._read_atoms(pdb)
+            plddt = self._looks_like_plddt(atoms)
+            bres: Dict[Tuple[str, str], float] = {}
+            for a in atoms:
+                if not a["het"]:
+                    bres.setdefault((a["chain"], a["resid"]), a["b"])
+            cands = self._detect_ligand_sites(atoms) + self._detect_metal_sites(atoms) + self._detect_motifs(atoms)
+            pockets = p2rank_results.get(stem, {}).get("pockets", [])
+            for c in cands:
+                tset = {(ch, r) for ch, r in c["residues"]}
+                rank = next((p["rank"] for p in pockets
+                             if any(self._residue_matches(ch, r, tset) for ch, r in self._p2rank_pocket_residues(p))), None)
+                c["p2rank_rank"] = rank
+                c["plddt_mean"] = round(sum(bres.get(r, 0) for r in c["residues"]) / len(c["residues"]), 1) if plddt else None
+                c["rank_score"] = c["score"] + (10.0 / rank if rank else -5.0) \
+                    - (15.0 if (c["plddt_mean"] is not None and c["plddt_mean"] < 70) else 0.0)
+            cands = [c for c in cands if not c.get("requires_pocket")
+                     or (c["p2rank_rank"] and c["p2rank_rank"] <= self.DYAD_MAX_POCKET_RANK)]
+            cands.sort(key=lambda c: -c["rank_score"])
+            fmt = lambda c: ",".join(f"{ch}:{r}" if ch else r for ch, r in c["residues"])
+            if cands:
+                best = cands[0]
+                conf = "high" if best["source"] == "ligand" or (best["source"] == "motif" and best["p2rank_rank"] == 1) \
+                    else "medium" if best["p2rank_rank"] else "low"
+                if best.get("requires_pocket"):
+                    conf = "low"                      # chance-prone motif: never more than low
+                if len(cands) > 1 and cands[1]["source"] == best["source"] and \
+                        cands[1]["rank_score"] > best["rank_score"] - 2 and set(cands[1]["residues"]) != set(best["residues"]):
+                    conf = "low"                      # near-tie between different sites
+                report[stem] = dict(resids=fmt(best), source=best["source"], name=best["name"],
+                                    detail=best.get("detail", ""), confidence=conf,
+                                    plddt_mean=best["plddt_mean"], p2rank_rank=best["p2rank_rank"],
+                                    alternatives=[dict(resids=fmt(c), source=c["source"], name=c["name"],
+                                                       detail=c.get("detail", ""), p2rank_rank=c["p2rank_rank"],
+                                                       plddt_mean=c["plddt_mean"], score=round(c["rank_score"], 2))
+                                                  for c in cands[1:8]])
+            else:
+                report[stem] = dict(resids="", source="none", name="no candidate", confidence="none",
+                                    detail="no ligand, metal site or known catalytic motif; "
+                                           "CAVER will start at P2Rank's top pocket", alternatives=[])
+            r = report[stem]
+            print(f"   • {stem}: [{r['source']}/{r['confidence']}] {r['name']} -> {r['resids'] or '-'}")
+        return report
 
     def setup_environment(self):
         print("=" * 70)
@@ -798,7 +1074,8 @@ seed 1
 
     def generate_summary_report(self, p2rank_results: Dict, caver_results: Dict,
                                 fpocket_selected_df: Optional[pd.DataFrame] = None,
-                                active_site_resids: ActiveSiteSpec = "") -> pd.DataFrame:
+                                active_site_resids: ActiveSiteSpec = "",
+                                site_report: Optional[Dict[str, Dict]] = None) -> pd.DataFrame:
         """
         One row per input structure. Rows are keyed by the input file stem; a
         structure that was CAVER-analysed as part of a frame group gets that
@@ -847,10 +1124,14 @@ seed 1
                 cv_status = "Success"
 
             xyz = start.get("xyz")
+            site = (site_report or {}).get(p, {})
             row = {
                 "Protein": p,
                 "Active_Site_Residues": " ".join(f"{c + ':' if c else ''}{n}" for c, n in sorted(
                     targets, key=lambda t: (t[0] or "", t[1]))),
+                "Active_Site_Source": site.get("source", "user" if targets else "none"),
+                "Active_Site_Basis": site.get("name", ""),
+                "Active_Site_Confidence": site.get("confidence", "user" if targets else "none"),
                 "Total_Pockets": r1.get("summary", {}).get("total_pockets", 0),
                 "Top_Pocket_Score": round(top.get("score", nan), 2),
                 "Top_Pocket_Probability": round(top.get("probability", nan), 3),
@@ -1190,13 +1471,17 @@ seed 1
                 caver_probe_radius: float = 0.9,
                 run_fpocket: bool = True, fpocket_protein_only: bool = True,
                 active_site_resids: ActiveSiteSpec = "", fpocket_timeout: int = 300,
-                caver_group_frames: bool = False) -> Dict:
+                caver_group_frames: bool = False, auto_active_site: bool = True) -> Dict:
         """Run P2Rank + CAVER + fpocket, build the merged report, return a result bundle.
 
         active_site_resids: see ActiveSiteSpec at the top of this file. It drives
         fpocket pocket selection, the P2Rank active-site pocket columns, and the
-        CAVER starting point. Without it, CAVER starts at P2Rank's top pocket and
-        the report flags this as a warning.
+        CAVER starting point.
+        auto_active_site: for every structure the spec gives no residues for,
+        detect one (ligand > metal > catalytic motif, see detect_active_sites).
+        The decision and all alternatives are written to
+        integrated_summary/active_sites_auto.json for review. Structures with no
+        candidate fall back to P2Rank's top pocket, flagged as a warning.
         """
         if pdb_files is None:
             pdb_files = sorted(self.input_dir.glob("*.pdb"))
@@ -1212,6 +1497,17 @@ seed 1
         p2rank_results = self.run_p2rank(pdb_files=pdb_files,
                                          min_score=p2rank_min_score,
                                          threads=p2rank_threads)
+
+        site_report: Dict[str, Dict] = {}
+        if auto_active_site:
+            print("\n" + "=" * 70)
+            print("🎯 Active sites (user-supplied or auto-detected)")
+            print("=" * 70)
+            site_report = self.detect_active_sites(pdb_files, p2rank_results, given=active_site_resids)
+            with open(self.integrated_output / "active_sites_auto.json", "w") as f:
+                json.dump(site_report, f, indent=1)
+            # from here on every step uses the resolved per-structure residues
+            active_site_resids = {s: r["resids"] for s, r in site_report.items() if r["resids"]}
 
         try:
             caver_results = self.run_caver(pdb_files=pdb_files,
@@ -1236,7 +1532,7 @@ seed 1
 
         summary_df = self.generate_summary_report(
             p2rank_results, caver_results, fpocket_selected_df,
-            active_site_resids=active_site_resids)
+            active_site_resids=active_site_resids, site_report=site_report)
         self.save_detailed_results(p2rank_results, caver_results)
 
         # Consolidated copies for convenience
@@ -1262,6 +1558,7 @@ seed 1
             "fpocket_selected_df": fpocket_selected_df,
             "p2rank_results": p2rank_results,
             "caver_results": caver_results,
+            "active_sites": site_report,
             "counts": counts,
         }
 
